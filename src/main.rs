@@ -9,9 +9,9 @@ fn main() {
     let mut io = IO::new();
 
     io.keyboard_mut().press(Button::A);
-    io.write_keypad_selection(0x4000);
+    io.write_port(0xB5, 0x40);
 
-    let input_value = io.read_keypad_inputs();
+    let value = io.read_port(0xB5);
 
-    println!("Keypad register: {:#06X}", input_value);
+    println!("Port 0xB5: {:#04X}", value);
 }

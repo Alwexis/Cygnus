@@ -1,6 +1,8 @@
 use crate::keyboard::Keyboard;
 use crate::keypad::Keypad;
 
+const KEYPAD_PORT: u8 = 0xB5;
+
 pub struct IO {
     keyboard: Keyboard,
     keypad: Keypad,
@@ -18,12 +20,20 @@ impl IO {
         &mut self.keyboard
     }
 
-    pub fn write_keypad_selection(&mut self, value: u16) {
-        self.keypad.write_selection(value);
+    pub fn read_port(&self, port: u8) -> u8 {
+        match port {
+            KEYPAD_PORT => (self.keypad.read_inputs(&self.keyboard) >> 8) as u8,
+            _ => 0xFF,
+        }
     }
 
-    pub fn read_keypad_inputs(&self) -> u16 {
-        self.keypad.read_inputs(&self.keyboard)
+    pub fn write_port(&mut self, port: u8, value: u8) {
+        match port {
+            KEYPAD_PORT => {
+                self.keypad.write_selection((value as u16) << 8);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -33,35 +43,39 @@ mod tests {
     use crate::keyboard::Button;
 
     #[test]
-    fn reading_special_group_should_return_pressed_a() {
+    fn writing_b5_and_reading_a_pressed_should_return_44() {
         let mut io = IO::new();
 
         io.keyboard_mut().press(Button::A);
-        io.write_keypad_selection(0x4000);
+        io.write_port(0xB5, 0x40);
 
-        assert_eq!(io.read_keypad_inputs(), 0x4400);
+        assert_eq!(io.read_port(0xB5), 0x44);
     }
 
     #[test]
-    fn reading_x_group_should_not_read_special_buttons() {
+    fn reading_b5_without_pressed_buttons_should_return_selection() {
         let mut io = IO::new();
 
-        io.keyboard_mut().press(Button::A);
-        io.write_keypad_selection(0x2000);
+        io.write_port(0xB5, 0x20);
 
-        assert_eq!(io.read_keypad_inputs(), 0x2000);
+        assert_eq!(io.read_port(0xB5), 0x20);
     }
 
     #[test]
-    fn reading_special_group_should_map_all_buttons_correctly() {
+    fn reading_unimplemented_port_should_return_ff() {
+        let io = IO::new();
+
+        assert_eq!(io.read_port(0x00), 0xFF);
+    }
+
+    #[test]
+    fn reading_b5_should_not_include_buttons_from_another_group() {
         let mut io = IO::new();
 
-        io.keyboard_mut().press(Button::Start);
         io.keyboard_mut().press(Button::A);
-        io.keyboard_mut().press(Button::B);
+        io.keyboard_mut().press(Button::X1);
+        io.write_port(0xB5, 0x20);
 
-        io.write_keypad_selection(0x4000);
-
-        assert_eq!(io.read_keypad_inputs(), 0x4E00);
+        assert_eq!(io.read_port(0xB5), 0x21);
     }
 }
