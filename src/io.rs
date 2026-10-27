@@ -18,11 +18,11 @@ impl IO {
         &mut self.keyboard
     }
 
-    pub fn write_keypad_selection(&mut self, value: u8) {
+    pub fn write_keypad_selection(&mut self, value: u16) {
         self.keypad.write_selection(value);
     }
 
-    pub fn read_keypad_inputs(&self) -> u8 {
+    pub fn read_keypad_inputs(&self) -> u16 {
         self.keypad.read_inputs(&self.keyboard)
     }
 }
@@ -37,9 +37,9 @@ mod tests {
         let mut io = IO::new();
 
         io.keyboard_mut().press(Button::A);
-        io.write_keypad_selection(0x40);
+        io.write_keypad_selection(0x4000);
 
-        assert_eq!(io.read_keypad_inputs(), 0x44);
+        assert_eq!(io.read_keypad_inputs(), 0x4400);
     }
 
     #[test]
@@ -47,8 +47,21 @@ mod tests {
         let mut io = IO::new();
 
         io.keyboard_mut().press(Button::A);
-        io.write_keypad_selection(0x20);
+        io.write_keypad_selection(0x2000);
 
-        assert_eq!(io.read_keypad_inputs(), 0x20);
+        assert_eq!(io.read_keypad_inputs(), 0x2000);
+    }
+
+    #[test]
+    fn reading_special_group_should_map_all_buttons_correctly() {
+        let mut io = IO::new();
+
+        io.keyboard_mut().press(Button::Start);
+        io.keyboard_mut().press(Button::A);
+        io.keyboard_mut().press(Button::B);
+
+        io.write_keypad_selection(0x4000);
+
+        assert_eq!(io.read_keypad_inputs(), 0x4E00);
     }
 }
