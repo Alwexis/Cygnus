@@ -502,6 +502,43 @@ impl Cpu {
         Ok(value)
     }
 
+    fn enter_interrupt(&mut self, bus: &mut Bus, vector: u8) -> Result<(), CpuError> {
+        let vector_address = u32::from(vector) * 4;
+        let offset = u16::from_le_bytes([
+            bus.read_byte(vector_address)
+                .ok_or(CpuError::UnmappedMemory(vector_address))?,
+            bus.read_byte(vector_address + 1)
+                .ok_or(CpuError::UnmappedMemory(vector_address + 1))?,
+        ]);
+        let segment = u16::from_le_bytes([
+            bus.read_byte(vector_address + 2)
+                .ok_or(CpuError::UnmappedMemory(vector_address + 2))?,
+            bus.read_byte(vector_address + 3)
+                .ok_or(CpuError::UnmappedMemory(vector_address + 3))?,
+        ]);
+
+        self.push_word(bus, self.flags)?;
+        self.push_word(bus, self.cs)?;
+        self.push_word(bus, self.ip)?;
+        self.flags &= !(FLAG_INTERRUPT | FLAG_TRAP);
+        self.cs = segment;
+        self.ip = offset;
+        self.halted = false;
+        Ok(())
+    }
+
+    fn service_pending_interrupt(&mut self, bus: &mut Bus) -> Result<bool, CpuError> {
+        if self.flags & FLAG_INTERRUPT == 0 {
+            return Ok(false);
+        }
+
+        let Some(vector) = bus.take_pending_interrupt() else {
+            return Ok(false);
+        };
+        self.enter_interrupt(bus, vector)?;
+        Ok(true)
+    }
+
     fn get_register16(&self, index: u8) -> u16 {
         match index {
             0 => self.ax,
@@ -1169,6 +1206,11 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
+        if self.service_pending_interrupt(bus)? {
+            bus.tick(1);
+            return Ok(());
+        }
+
         if self.halted {
             return Ok(());
         }
@@ -1367,6 +1409,24 @@ impl Cpu {
             // CALL FAR m16:16
             0xFF => self.execute_ff_modrm(bus)?,
 
+            // INT imm8 / INT3
+            0xCD => {
+                let vector = self.fetch_byte(bus)?;
+                self.enter_interrupt(bus, vector)?;
+            }
+            0xCC => self.enter_interrupt(bus, 3)?,
+
+            // IRET
+            0xCF => {
+                self.ip = self.pop_word(bus)?;
+                self.cs = self.pop_word(bus)?;
+                self.flags = self.pop_word(bus)? | FLAG_RESERVED;
+            }
+
+            // PUSHF / POPF
+            0x9C => self.push_word(bus, self.flags)?,
+            0x9D => self.flags = self.pop_word(bus)? | FLAG_RESERVED,
+
             // RET near
             0xC3 => {
                 self.ip = self.pop_word(bus)?;
@@ -1524,6 +1584,7 @@ impl Cpu {
             }
         }
 
+        bus.tick(1);
         Ok(())
     }
 
@@ -1604,6 +1665,12 @@ mod tests {
     fn write_program(bus: &mut Bus, bytes: &[u8]) {
         for (address, value) in bytes.iter().copied().enumerate() {
             assert!(bus.write_byte(address as u32, value));
+        }
+    }
+
+    fn write_bytes(bus: &mut Bus, address: u32, bytes: &[u8]) {
+        for (offset, value) in bytes.iter().copied().enumerate() {
+            assert!(bus.write_byte(address + offset as u32, value));
         }
     }
 
@@ -2445,6 +2512,67 @@ mod tests {
         assert_eq!(bus.read_byte(0x0200), Some(0x00));
         assert_eq!(bus.read_byte(0x0201), Some(0x01));
         assert_ne!(cpu.flags & FLAG_CARRY, 0);
+    }
+
+    #[test]
+    fn software_interrupt_and_iret_restore_execution_state() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ss = 0;
+        cpu.sp = 0x0200;
+        cpu.flags = FLAG_INTERRUPT | FLAG_CARRY | FLAG_RESERVED;
+        write_bytes(&mut bus, 0x20 * 4, &[0x00, 0x01, 0x00, 0x00]);
+        write_program(&mut bus, &[0xCD, 0x20]);
+        write_bytes(&mut bus, 0x0100, &[0xCF]);
+
+        cpu.step(&mut bus).unwrap();
+        assert_eq!((cpu.cs, cpu.ip), (0, 0x0100));
+        assert_eq!(cpu.flags & FLAG_INTERRUPT, 0);
+
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.ip, 2);
+        assert_ne!(cpu.flags & FLAG_INTERRUPT, 0);
+        assert_ne!(cpu.flags & FLAG_CARRY, 0);
+    }
+
+    #[test]
+    fn pending_interrupt_wakes_halted_cpu() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.flags = FLAG_INTERRUPT | FLAG_RESERVED;
+        cpu.sp = 0x0200;
+        write_program(&mut bus, &[0xF4]);
+        write_bytes(&mut bus, 0x08 * 4, &[0x00, 0x01, 0x00, 0x00]);
+        write_bytes(&mut bus, 0x0100, &[0xF4]);
+
+        cpu.step(&mut bus).unwrap();
+        assert!(cpu.halted);
+        bus.request_interrupt(0x08);
+        cpu.step(&mut bus).unwrap();
+
+        assert!(!cpu.halted);
+        assert_eq!(cpu.ip, 0x0100);
+    }
+
+    #[test]
+    fn timer_interrupt_enters_configured_vector_after_a_cpu_step() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.flags = FLAG_INTERRUPT | FLAG_RESERVED;
+        cpu.sp = 0x0200;
+        write_program(&mut bus, &[0x90]);
+        write_bytes(&mut bus, 0x08 * 4, &[0x00, 0x01, 0x00, 0x00]);
+        bus.configure_timer(1, 0x08);
+
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.ip, 1);
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ip, 0x0100);
+        assert_eq!(cpu.cs, 0);
     }
 
     #[test]

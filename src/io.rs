@@ -11,11 +11,56 @@ const ROM_BANK1_PORT: u8 = 0xC3;
 pub struct IO {
     keyboard: Keyboard,
     keypad: Keypad,
+    timer: Timer,
+    pending_interrupt: Option<u8>,
 
     rom_linear_bank: u8,
     ram_bank: u8,
     rom_bank0: u8,
     rom_bank1: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Timer {
+    period: u32,
+    counter: u32,
+    vector: u8,
+    enabled: bool,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Self {
+            period: 0,
+            counter: 0,
+            vector: 0,
+            enabled: false,
+        }
+    }
+
+    fn configure(&mut self, period: u32, vector: u8) {
+        self.period = period;
+        self.counter = period;
+        self.vector = vector;
+        self.enabled = period != 0;
+    }
+
+    fn tick(&mut self, cycles: u32) -> Option<u8> {
+        if !self.enabled {
+            return None;
+        }
+
+        let mut remaining = cycles;
+        while remaining >= self.counter {
+            remaining -= self.counter;
+            self.counter = self.period;
+            if remaining == 0 {
+                return Some(self.vector);
+            }
+        }
+        self.counter -= remaining;
+        None
+    }
 }
 
 impl IO {
@@ -27,6 +72,8 @@ impl IO {
         Self {
             keyboard: Keyboard::new(),
             keypad: Keypad::new(),
+            timer: Timer::new(),
+            pending_interrupt: None,
             rom_linear_bank: linear_bank,
             ram_bank: 0,
             rom_bank0: 0,
@@ -36,6 +83,24 @@ impl IO {
 
     pub fn keyboard_mut(&mut self) -> &mut Keyboard {
         &mut self.keyboard
+    }
+
+    pub fn configure_timer(&mut self, period: u32, vector: u8) {
+        self.timer.configure(period, vector);
+    }
+
+    pub fn tick(&mut self, cycles: u32) {
+        if let Some(vector) = self.timer.tick(cycles) {
+            self.pending_interrupt = Some(vector);
+        }
+    }
+
+    pub fn request_interrupt(&mut self, vector: u8) {
+        self.pending_interrupt = Some(vector);
+    }
+
+    pub fn take_pending_interrupt(&mut self) -> Option<u8> {
+        self.pending_interrupt.take()
     }
 
     pub fn rom_linear_bank(&self) -> u8 {
@@ -121,5 +186,18 @@ mod tests {
         io.write_port(0xB5, 0x40);
 
         assert_eq!(io.read_port(0xB5), 0x44);
+    }
+
+    #[test]
+    fn timer_requests_periodic_interrupts() {
+        let mut io = IO::new();
+        io.configure_timer(3, 0x08);
+
+        io.tick(2);
+        assert_eq!(io.take_pending_interrupt(), None);
+        io.tick(1);
+        assert_eq!(io.take_pending_interrupt(), Some(0x08));
+        io.tick(3);
+        assert_eq!(io.take_pending_interrupt(), Some(0x08));
     }
 }

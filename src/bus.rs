@@ -88,6 +88,7 @@ impl Bus {
                     value
                 }
             }
+
             0xC2 | 0xC3 => {
                 let bank_count = self.memory.rom_size() / 0x10000;
                 if bank_count > 1 {
@@ -107,6 +108,22 @@ impl Bus {
             }
             _ => {}
         }
+    }
+
+    pub fn tick(&mut self, cycles: u32) {
+        self.io.tick(cycles);
+    }
+
+    pub fn configure_timer(&mut self, period: u32, vector: u8) {
+        self.io.configure_timer(period, vector);
+    }
+
+    pub fn request_interrupt(&mut self, vector: u8) {
+        self.io.request_interrupt(vector);
+    }
+
+    pub fn take_pending_interrupt(&mut self) -> Option<u8> {
+        self.io.take_pending_interrupt()
     }
 
     pub fn keyboard_mut(&mut self) -> &mut crate::keyboard::Keyboard {
