@@ -8,6 +8,8 @@ pub const BORDER_COLOR_PORT: u8 = 0x01;
 pub const TILE_MAP_PORT: u8 = 0x07;
 pub const BG1_SCROLL_X_PORT: u8 = 0x10;
 pub const BG1_SCROLL_Y_PORT: u8 = 0x11;
+pub const BG2_SCROLL_X_PORT: u8 = 0x12;
+pub const BG2_SCROLL_Y_PORT: u8 = 0x13;
 pub const LCD_CONTROL_PORT: u8 = 0x14;
 pub const COLOR_CONTROL_PORT: u8 = 0x60;
 
@@ -67,13 +69,41 @@ impl Video {
 
     pub fn render_background(&mut self, ram: &[u8]) {
         self.clear(self.registers[usize::from(BORDER_COLOR_PORT)] & 0x0F);
-        if self.registers[usize::from(DISPLAY_CONTROL_PORT)] & 0x01 == 0 {
+        let display_control = self.registers[usize::from(DISPLAY_CONTROL_PORT)];
+        if display_control & 0x03 == 0 {
             return;
         }
 
-        let map_base = (usize::from(self.registers[usize::from(TILE_MAP_PORT)] & 0x0F)) << 11;
-        let scroll_x = usize::from(self.registers[usize::from(BG1_SCROLL_X_PORT)]);
-        let scroll_y = usize::from(self.registers[usize::from(BG1_SCROLL_Y_PORT)]);
+        if display_control & 0x01 != 0 {
+            self.render_layer(
+                ram,
+                usize::from(self.registers[usize::from(TILE_MAP_PORT)] & 0x0F) << 11,
+                BG1_SCROLL_X_PORT,
+                BG1_SCROLL_Y_PORT,
+                false,
+            );
+        }
+        if display_control & 0x02 != 0 {
+            self.render_layer(
+                ram,
+                usize::from(self.registers[usize::from(TILE_MAP_PORT)] >> 4) << 11,
+                BG2_SCROLL_X_PORT,
+                BG2_SCROLL_Y_PORT,
+                true,
+            );
+        }
+    }
+
+    fn render_layer(
+        &mut self,
+        ram: &[u8],
+        map_base: usize,
+        scroll_x_port: u8,
+        scroll_y_port: u8,
+        transparent_zero: bool,
+    ) {
+        let scroll_x = usize::from(self.registers[usize::from(scroll_x_port)]);
+        let scroll_y = usize::from(self.registers[usize::from(scroll_y_port)]);
         let tile_base = if self.color_control & 0x40 != 0 {
             0x4000
         } else {
@@ -117,7 +147,9 @@ impl Video {
                 } else {
                     packed & 0x0F
                 };
-                self.framebuffer[y * SCREEN_WIDTH + x] = color;
+                if !transparent_zero || color != 0 {
+                    self.framebuffer[y * SCREEN_WIDTH + x] = color;
+                }
             }
         }
     }
@@ -183,6 +215,27 @@ mod tests {
         video.render_background(&ram);
 
         assert_eq!(video.pixel(0, 0), Some(1));
+        assert_eq!(video.pixel(1, 0), Some(2));
+    }
+
+    #[test]
+    fn second_background_overlays_nonzero_pixels() {
+        let mut video = Video::new();
+        let mut ram = vec![0; 0x10000];
+
+        video.write_port(DISPLAY_CONTROL_PORT, 0x03);
+        video.write_port(COLOR_CONTROL_PORT, 0x40);
+        video.write_port(TILE_MAP_PORT, 0x10);
+        ram[0] = 0;
+        ram[1] = 0;
+        ram[0x800] = 1;
+        ram[0x801] = 0;
+        ram[0x4000] = 0x12;
+        ram[0x4020] = 0x30;
+
+        video.render_background(&ram);
+
+        assert_eq!(video.pixel(0, 0), Some(3));
         assert_eq!(video.pixel(1, 0), Some(2));
     }
 }

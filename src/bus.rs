@@ -112,6 +112,9 @@ impl Bus {
 
     pub fn tick(&mut self, cycles: u32) {
         self.io.tick(cycles);
+        if self.io.take_frame_ready() {
+            self.render_frame();
+        }
     }
 
     pub fn configure_timer(&mut self, period: u32, vector: u8) {

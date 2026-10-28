@@ -46,6 +46,7 @@ pub struct IO {
     scanline_control: u8,
     horizontal_counter: u16,
     vertical_counter: u32,
+    frame_ready: bool,
 
     rom_linear_bank: u8,
     ram_bank: u8,
@@ -126,6 +127,7 @@ impl IO {
             scanline_control: 0,
             horizontal_counter: 0,
             vertical_counter: 0,
+            frame_ready: false,
             rom_linear_bank: linear_bank,
             ram_bank: 0,
             rom_bank0: 0,
@@ -174,8 +176,15 @@ impl IO {
             }
             if self.scanline >= TOTAL_SCANLINES {
                 self.scanline = 0;
+                self.frame_ready = true;
             }
         }
+    }
+
+    pub fn take_frame_ready(&mut self) -> bool {
+        let frame_ready = self.frame_ready;
+        self.frame_ready = false;
+        frame_ready
     }
 
     pub fn request_interrupt(&mut self, vector: u8) {
