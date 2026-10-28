@@ -211,7 +211,7 @@ impl IO {
     }
 
     pub fn read_port(&self, port: u8) -> u8 {
-        if Self::is_video_register(port) {
+        if Self::is_video_register(port) || port == crate::video::COLOR_CONTROL_PORT {
             return self.video.read_port(port);
         }
 
@@ -243,7 +243,7 @@ impl IO {
     }
 
     pub fn write_port(&mut self, port: u8, value: u8) {
-        if Self::is_video_register(port) {
+        if Self::is_video_register(port) || port == crate::video::COLOR_CONTROL_PORT {
             self.video.write_port(port, value);
             return;
         }
@@ -373,6 +373,15 @@ mod tests {
 
         assert_eq!(io.read_port(0x10), 0xA5);
         assert_eq!(io.video().read_port(0x10), 0xA5);
+    }
+
+    #[test]
+    fn color_control_port_is_backed_by_video_state() {
+        let mut io = IO::new();
+
+        io.write_port(crate::video::COLOR_CONTROL_PORT, 0x40);
+
+        assert_eq!(io.read_port(crate::video::COLOR_CONTROL_PORT), 0x40);
     }
 
     #[test]

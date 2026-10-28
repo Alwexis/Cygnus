@@ -133,6 +133,10 @@ impl Bus {
     pub fn framebuffer(&self) -> &[u8] {
         self.io.video().framebuffer()
     }
+
+    pub fn render_frame(&mut self) {
+        self.io.video_mut().render_background(&self.internal_ram);
+    }
 }
 
 #[cfg(test)]
