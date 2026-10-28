@@ -1,2 +1,6 @@
 *.local*
 cartridges/
+
+# Added by cargo
+
+/target
