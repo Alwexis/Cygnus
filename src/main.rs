@@ -1,5 +1,6 @@
 mod bus;
 mod cartridge;
+mod cpu;
 mod io;
 mod keyboard;
 mod keypad;
