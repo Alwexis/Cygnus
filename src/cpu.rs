@@ -42,6 +42,7 @@ pub struct Cpu {
     pub ip: u16,
     pub flags: u16,
     pub halted: bool,
+    segment_override: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +73,7 @@ impl Cpu {
             ip: 0,
             flags: FLAG_RESERVED,
             halted: false,
+            segment_override: None,
         }
     }
 
@@ -103,7 +105,8 @@ impl Cpu {
             0 if rm == 6 => {
                 // mod=00, r/m=110: dirección directa disp16.
                 let offset = self.fetch_word(bus)?;
-                return Ok((self.ds, offset));
+                let segment = self.segment_override.take().unwrap_or(self.ds);
+                return Ok((segment, offset));
             }
             0 => 0,
             1 => self.fetch_byte(bus)? as i8 as i16,
@@ -124,7 +127,10 @@ impl Cpu {
         };
 
         let offset = base.wrapping_add(displacement as u16);
-        let segment = if uses_bp { self.ss } else { self.ds };
+        let segment =
+            self.segment_override
+                .take()
+                .unwrap_or(if uses_bp { self.ss } else { self.ds });
 
         Ok((segment, offset))
     }
@@ -174,6 +180,97 @@ impl Cpu {
         Ok(())
     }
 
+    fn execute_shift_modrm(&mut self, bus: &mut Bus, opcode: u8) -> Result<(), CpuError> {
+        let modrm = self.fetch_byte(bus)?;
+        let mode = modrm >> 6;
+        let operation = (modrm >> 3) & 7;
+        let width = if opcode == 0xD0 { 8 } else { 16 };
+
+        if operation != 4 || mode != 0b11 {
+            return Err(CpuError::UnsupportedOpcode {
+                opcode,
+                cs: self.cs,
+                ip: self.ip.wrapping_sub(2),
+            });
+        }
+
+        let value = if width == 8 {
+            u16::from(self.get_register8(modrm & 7))
+        } else {
+            self.get_register16(modrm & 7)
+        };
+        let result = value >> 1;
+        self.set_flag(FLAG_CARRY, value & 1 != 0);
+        self.update_common_flags(result, width);
+
+        if width == 8 {
+            self.set_register8(modrm & 7, result as u8);
+        } else {
+            self.set_register16(modrm & 7, result);
+        }
+
+        Ok(())
+    }
+
+    fn execute_immediate_modrm(&mut self, bus: &mut Bus, opcode: u8) -> Result<(), CpuError> {
+        let modrm = self.fetch_byte(bus)?;
+        let mode = modrm >> 6;
+        let operation = (modrm >> 3) & 7;
+
+        let alu_operation = match operation {
+            0 => AluOperation::Add,
+            1 => AluOperation::Or,
+            4 => AluOperation::And,
+            5 => AluOperation::Sub,
+            6 => AluOperation::Xor,
+            7 => AluOperation::Compare,
+            _ => {
+                return Err(CpuError::UnsupportedOpcode {
+                    opcode,
+                    cs: self.cs,
+                    ip: self.ip.wrapping_sub(2),
+                });
+            }
+        };
+        let address = if mode == 0b11 {
+            None
+        } else {
+            Some(self.decode_memory_address(bus, modrm)?)
+        };
+        let left = if let Some((segment, offset)) = address {
+            self.read_memory_word(bus, segment, offset)?
+        } else {
+            self.get_register16(modrm & 7)
+        };
+        let right = if opcode == 0x83 {
+            i16::from(self.fetch_byte(bus)? as i8) as u16
+        } else {
+            self.fetch_word(bus)?
+        };
+        let result = self.execute_alu(alu_operation, left, right, 16);
+
+        if alu_operation != AluOperation::Compare {
+            if let Some((segment, offset)) = address {
+                self.write_memory_word(bus, segment, offset, result)?;
+            } else {
+                self.set_register16(modrm & 7, result);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn push_word(&mut self, bus: &mut Bus, value: u16) -> Result<(), CpuError> {
+        self.sp = self.sp.wrapping_sub(2);
+        self.write_memory_word(bus, self.ss, self.sp, value)
+    }
+
+    fn pop_word(&mut self, bus: &Bus) -> Result<u16, CpuError> {
+        let value = self.read_memory_word(bus, self.ss, self.sp)?;
+        self.sp = self.sp.wrapping_add(2);
+        Ok(value)
+    }
+
     fn get_register16(&self, index: u8) -> u16 {
         match index {
             0 => self.ax,
@@ -199,6 +296,26 @@ impl Cpu {
             6 => self.si = value,
             7 => self.di = value,
             _ => unreachable!("Índice de registro inválido"),
+        }
+    }
+
+    fn get_segment_register(&self, index: u8) -> u16 {
+        match index {
+            0 => self.es,
+            1 => self.cs,
+            2 => self.ss,
+            3 => self.ds,
+            _ => unreachable!("Índice de segmento inválido"),
+        }
+    }
+
+    fn set_segment_register(&mut self, index: u8, value: u16) {
+        match index {
+            0 => self.es = value,
+            1 => self.cs = value,
+            2 => self.ss = value,
+            3 => self.ds = value,
+            _ => unreachable!("Índice de segmento inválido"),
         }
     }
 
@@ -308,6 +425,33 @@ impl Cpu {
         let width = if opcode & 1 == 0 { 8 } else { 16 };
         let direction_to_reg = opcode & 2 != 0;
 
+        // TEST r/m8,r8; TEST r/m16,r16.
+        if opcode == 0x84 || opcode == 0x85 {
+            let left = if mode == 0b11 {
+                if width == 8 {
+                    u16::from(self.get_register8(rm))
+                } else {
+                    self.get_register16(rm)
+                }
+            } else {
+                let (segment, offset) = self.decode_memory_address(bus, modrm)?;
+
+                if width == 8 {
+                    u16::from(self.read_memory_byte(bus, segment, offset)?)
+                } else {
+                    self.read_memory_word(bus, segment, offset)?
+                }
+            };
+            let right = if width == 8 {
+                u16::from(self.get_register8(reg))
+            } else {
+                self.get_register16(reg)
+            };
+
+            self.execute_alu(AluOperation::And, left, right, width);
+            return Ok(());
+        }
+
         // MOV r/m,reg y MOV reg,r/m.
         if (0x88..=0x8B).contains(&opcode) {
             if mode == 0b11 {
@@ -350,6 +494,35 @@ impl Cpu {
             } else {
                 let value = self.get_register16(reg);
                 self.write_memory_word(bus, segment, offset, value)?;
+            }
+
+            return Ok(());
+        }
+
+        // MOV Sreg,r/m16 y MOV r/m16,Sreg.
+        if (0x8C..=0x8E).contains(&opcode) {
+            if opcode == 0x8D {
+                return Err(CpuError::UnsupportedOpcode {
+                    opcode,
+                    cs: self.cs,
+                    ip: self.ip.wrapping_sub(2),
+                });
+            }
+
+            if mode == 0b11 {
+                if opcode == 0x8E {
+                    self.set_segment_register(reg, self.get_register16(rm));
+                } else {
+                    self.set_register16(rm, self.get_segment_register(reg));
+                }
+            } else {
+                let (segment, offset) = self.decode_memory_address(bus, modrm)?;
+
+                if opcode == 0x8E {
+                    self.set_segment_register(reg, self.read_memory_word(bus, segment, offset)?);
+                } else {
+                    self.write_memory_word(bus, segment, offset, self.get_segment_register(reg))?;
+                }
             }
 
             return Ok(());
@@ -468,6 +641,167 @@ impl Cpu {
         Ok(())
     }
 
+    fn execute_test_accumulator(&mut self, bus: &mut Bus, opcode: u8) -> Result<(), CpuError> {
+        let width = if opcode == 0xA8 { 8 } else { 16 };
+        let immediate = if width == 8 {
+            u16::from(self.fetch_byte(bus)?)
+        } else {
+            self.fetch_word(bus)?
+        };
+        let accumulator = if width == 8 {
+            u16::from(self.get_register8(0))
+        } else {
+            self.ax
+        };
+
+        self.execute_alu(AluOperation::And, accumulator, immediate, width);
+        Ok(())
+    }
+
+    fn execute_move_accumulator_moffs(
+        &mut self,
+        bus: &mut Bus,
+        opcode: u8,
+    ) -> Result<(), CpuError> {
+        let offset = self.fetch_word(bus)?;
+        let segment = self.segment_override.take().unwrap_or(self.ds);
+
+        match opcode {
+            0xA0 => {
+                let value = self.read_memory_byte(bus, segment, offset)?;
+                self.set_register8(0, value);
+            }
+            0xA1 => {
+                let value = self.read_memory_word(bus, segment, offset)?;
+                self.ax = value;
+            }
+            0xA2 => {
+                let value = self.get_register8(0);
+                self.write_memory_byte(bus, segment, offset, value)?;
+            }
+            0xA3 => {
+                self.write_memory_word(bus, segment, offset, self.ax)?;
+            }
+            _ => unreachable!("Opcode moffs inválido"),
+        }
+
+        Ok(())
+    }
+
+    fn execute_move_immediate_to_memory(
+        &mut self,
+        bus: &mut Bus,
+        opcode: u8,
+    ) -> Result<(), CpuError> {
+        let modrm = self.fetch_byte(bus)?;
+        let mode = modrm >> 6;
+        let reg = (modrm >> 3) & 7;
+        let width = if opcode == 0xC6 { 8 } else { 16 };
+
+        if reg != 0 {
+            return Err(CpuError::UnsupportedOpcode {
+                opcode,
+                cs: self.cs,
+                ip: self.ip.wrapping_sub(2),
+            });
+        }
+
+        if mode == 0b11 {
+            let value = if width == 8 {
+                u16::from(self.fetch_byte(bus)?)
+            } else {
+                self.fetch_word(bus)?
+            };
+
+            if width == 8 {
+                self.set_register8(modrm & 7, value as u8);
+            } else {
+                self.set_register16(modrm & 7, value);
+            }
+        } else {
+            let (segment, offset) = self.decode_memory_address(bus, modrm)?;
+            let value = if width == 8 {
+                u16::from(self.fetch_byte(bus)?)
+            } else {
+                self.fetch_word(bus)?
+            };
+
+            if width == 8 {
+                self.write_memory_byte(bus, segment, offset, value as u8)?;
+            } else {
+                self.write_memory_word(bus, segment, offset, value)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn execute_test_modrm(&mut self, bus: &mut Bus, opcode: u8) -> Result<(), CpuError> {
+        let modrm = self.fetch_byte(bus)?;
+        let mode = modrm >> 6;
+        let reg = (modrm >> 3) & 7;
+        let width = if opcode == 0xF6 { 8 } else { 16 };
+
+        if reg != 0 {
+            return Err(CpuError::UnsupportedOpcode {
+                opcode,
+                cs: self.cs,
+                ip: self.ip.wrapping_sub(2),
+            });
+        }
+
+        let operand = if mode == 0b11 {
+            if width == 8 {
+                u16::from(self.get_register8(modrm & 7))
+            } else {
+                self.get_register16(modrm & 7)
+            }
+        } else {
+            let (segment, offset) = self.decode_memory_address(bus, modrm)?;
+
+            if width == 8 {
+                u16::from(self.read_memory_byte(bus, segment, offset)?)
+            } else {
+                self.read_memory_word(bus, segment, offset)?
+            }
+        };
+        let immediate = if width == 8 {
+            u16::from(self.fetch_byte(bus)?)
+        } else {
+            self.fetch_word(bus)?
+        };
+
+        self.execute_alu(AluOperation::And, operand, immediate, width);
+        Ok(())
+    }
+
+    fn execute_stos_word(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
+        self.write_memory_word(bus, self.es, self.di, self.ax)?;
+
+        if self.flags & FLAG_DIRECTION == 0 {
+            self.di = self.di.wrapping_add(2);
+        } else {
+            self.di = self.di.wrapping_sub(2);
+        }
+
+        Ok(())
+    }
+
+    fn execute_movs_word(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
+        let value = self.read_memory_word(bus, self.ds, self.si)?;
+        self.write_memory_word(bus, self.es, self.di, value)?;
+
+        if self.flags & FLAG_DIRECTION == 0 {
+            self.si = self.si.wrapping_add(2);
+            self.di = self.di.wrapping_add(2);
+        } else {
+            self.si = self.si.wrapping_sub(2);
+            self.di = self.di.wrapping_sub(2);
+        }
+
+        Ok(())
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
         if self.halted {
             return Ok(());
@@ -494,7 +828,11 @@ impl Cpu {
             }
 
             // MOV r/m8,r8; MOV r/m16,r16; MOV r8,r/m8; MOV r16,r/m16
-            0x88..=0x8B => self.decode_register_modrm(bus, opcode)?,
+            // MOV Sreg,r/m16; MOV r/m16,Sreg
+            0x88..=0x8E => self.decode_register_modrm(bus, opcode)?,
+
+            // TEST r/m8,r8; TEST r/m16,r16
+            0x84 | 0x85 => self.decode_register_modrm(bus, opcode)?,
 
             // ADD, OR, AND, SUB, XOR, CMP entre registros
             0x00..=0x03 | 0x08..=0x0B | 0x20..=0x23 | 0x28..=0x2B | 0x30..=0x33 | 0x38..=0x3B => {
@@ -506,6 +844,118 @@ impl Cpu {
                 self.execute_accumulator_immediate(bus, opcode)?;
             }
 
+            // TEST AL/AX, imm
+            0xA8 | 0xA9 => self.execute_test_accumulator(bus, opcode)?,
+
+            // MOV AL/AX,moffs16; MOV moffs16,AL/AX
+            0xA0..=0xA3 => self.execute_move_accumulator_moffs(bus, opcode)?,
+
+            // Segment override prefixes.
+            0x26 => {
+                self.segment_override = Some(self.es);
+                self.step(bus)?;
+                self.segment_override = None;
+            }
+            0x2E => {
+                self.segment_override = Some(self.cs);
+                self.step(bus)?;
+                self.segment_override = None;
+            }
+            0x36 => {
+                self.segment_override = Some(self.ss);
+                self.step(bus)?;
+                self.segment_override = None;
+            }
+            0x3E => {
+                self.segment_override = Some(self.ds);
+                self.step(bus)?;
+                self.segment_override = None;
+            }
+
+            // MOV r/m8,imm8; MOV r/m16,imm16
+            0xC6 | 0xC7 => self.execute_move_immediate_to_memory(bus, opcode)?,
+
+            // TEST r/m8,imm8; TEST r/m16,imm16
+            0xF6 | 0xF7 => self.execute_test_modrm(bus, opcode)?,
+
+            // SHR r/m8,1; SHR r/m16,1
+            0xD0 | 0xD1 => self.execute_shift_modrm(bus, opcode)?,
+
+            // ALU r/m16,imm16; ALU r/m16,imm8 sign-extended
+            0x81 | 0x83 => self.execute_immediate_modrm(bus, opcode)?,
+
+            // LOOP rel8
+            0xE2 => {
+                let displacement = self.fetch_byte(bus)? as i8;
+                self.cx = self.cx.wrapping_sub(1);
+                if self.cx != 0 {
+                    self.ip = self.ip.wrapping_add_signed(displacement as i16);
+                }
+            }
+
+            // PUSH r16
+            0x50..=0x57 => {
+                self.push_word(bus, self.get_register16(opcode - 0x50))?;
+            }
+
+            // PUSHA
+            0x60 => {
+                let original_sp = self.sp;
+                self.push_word(bus, self.ax)?;
+                self.push_word(bus, self.cx)?;
+                self.push_word(bus, self.dx)?;
+                self.push_word(bus, self.bx)?;
+                self.push_word(bus, original_sp)?;
+                self.push_word(bus, self.bp)?;
+                self.push_word(bus, self.si)?;
+                self.push_word(bus, self.di)?;
+            }
+
+            // INC r16
+            0x40..=0x47 => {
+                let carry = self.flags & FLAG_CARRY;
+                let value = self.get_register16(opcode - 0x40);
+                let result = self.execute_alu(AluOperation::Add, value, 1, 16);
+                self.set_register16(opcode - 0x40, result);
+                self.flags = (self.flags & !FLAG_CARRY) | carry | FLAG_RESERVED;
+            }
+
+            // DEC r16
+            0x48..=0x4F => {
+                let carry = self.flags & FLAG_CARRY;
+                let value = self.get_register16(opcode - 0x48);
+                let result = self.execute_alu(AluOperation::Sub, value, 1, 16);
+                self.set_register16(opcode - 0x48, result);
+                self.flags = (self.flags & !FLAG_CARRY) | carry | FLAG_RESERVED;
+            }
+
+            // POP r16
+            0x58..=0x5F => {
+                let value = self.pop_word(bus)?;
+                self.set_register16(opcode - 0x58, value);
+            }
+
+            // POPA
+            0x61 => {
+                self.di = self.pop_word(bus)?;
+                self.si = self.pop_word(bus)?;
+                self.bp = self.pop_word(bus)?;
+                let _ = self.pop_word(bus)?;
+                self.bx = self.pop_word(bus)?;
+                self.dx = self.pop_word(bus)?;
+                self.cx = self.pop_word(bus)?;
+                self.ax = self.pop_word(bus)?;
+            }
+
+            // PUSH/POP segmento
+            0x06 => self.push_word(bus, self.es)?,
+            0x0E => self.push_word(bus, self.cs)?,
+            0x16 => self.push_word(bus, self.ss)?,
+            0x1E => self.push_word(bus, self.ds)?,
+            0x07 => self.es = self.pop_word(bus)?,
+            0x17 => self.ss = self.pop_word(bus)?,
+            0x1F => self.ds = self.pop_word(bus)?,
+
             // JMP rel8
             0xEB => {
                 let displacement = self.fetch_byte(bus)? as i8;
@@ -516,6 +966,117 @@ impl Cpu {
             0xE9 => {
                 let displacement = self.fetch_word(bus)? as i16;
                 self.ip = self.ip.wrapping_add_signed(displacement);
+            }
+
+            // JMP FAR ptr16:16
+            0xEA => {
+                let offset = self.fetch_word(bus)?;
+                let segment = self.fetch_word(bus)?;
+                self.ip = offset;
+                self.cs = segment;
+            }
+
+            // CALL FAR ptr16:16
+            0x9A => {
+                let offset = self.fetch_word(bus)?;
+                let segment = self.fetch_word(bus)?;
+                self.push_word(bus, self.cs)?;
+                self.push_word(bus, self.ip)?;
+                self.ip = offset;
+                self.cs = segment;
+            }
+
+            // RET near
+            0xC3 => {
+                self.ip = self.pop_word(bus)?;
+            }
+
+            // RET FAR
+            0xCB => {
+                self.ip = self.pop_word(bus)?;
+                self.cs = self.pop_word(bus)?;
+            }
+
+            // IN AL/AX, imm8
+            0xE4 | 0xE5 => {
+                let port = self.fetch_byte(bus);
+                let port = port?;
+
+                if opcode == 0xE4 {
+                    self.set_register8(0, bus.read_port(port));
+                } else {
+                    let low = bus.read_port(port);
+                    let high = bus.read_port(port.wrapping_add(1));
+                    self.ax = u16::from_le_bytes([low, high]);
+                }
+            }
+
+            // IN AL/AX, DX
+            0xEC | 0xED => {
+                let port = self.dx as u8;
+
+                if opcode == 0xEC {
+                    self.set_register8(0, bus.read_port(port));
+                } else {
+                    let low = bus.read_port(port);
+                    let high = bus.read_port(port.wrapping_add(1));
+                    self.ax = u16::from_le_bytes([low, high]);
+                }
+            }
+
+            // OUT imm8, AL/AX
+            0xE6 | 0xE7 => {
+                let port = self.fetch_byte(bus);
+                let port = port?;
+
+                if opcode == 0xE6 {
+                    bus.write_port(port, self.get_register8(0));
+                } else {
+                    let [low, high] = self.ax.to_le_bytes();
+                    bus.write_port(port, low);
+                    bus.write_port(port.wrapping_add(1), high);
+                }
+            }
+
+            // OUT DX, AL/AX
+            0xEE | 0xEF => {
+                let port = self.dx as u8;
+
+                if opcode == 0xEE {
+                    bus.write_port(port, self.get_register8(0));
+                } else {
+                    let [low, high] = self.ax.to_le_bytes();
+                    bus.write_port(port, low);
+                    bus.write_port(port.wrapping_add(1), high);
+                }
+            }
+
+            // MOVSW
+            0xA5 => self.execute_movs_word(bus)?,
+
+            // STOSW
+            0xAB => self.execute_stos_word(bus)?,
+
+            // REP MOVSW / REP STOSW
+            0xF3 => {
+                let repeated_opcode = self.fetch_byte(bus)?;
+
+                if repeated_opcode != 0xA5 && repeated_opcode != 0xAB {
+                    return Err(CpuError::UnsupportedOpcode {
+                        opcode: repeated_opcode,
+                        cs: self.cs,
+                        ip: self.ip.wrapping_sub(1),
+                    });
+                }
+
+                while self.cx != 0 {
+                    if repeated_opcode == 0xA5 {
+                        self.execute_movs_word(bus)?;
+                    } else {
+                        self.execute_stos_word(bus)?;
+                    }
+                    self.cx = self.cx.wrapping_sub(1);
+                }
             }
 
             // JZ / JE rel8
@@ -797,14 +1358,14 @@ mod tests {
     fn unsupported_opcode_returns_error() {
         let mut bus = test_bus();
         let mut cpu = cpu_at_zero();
-        write_program(&mut bus, &[0x06]);
+        write_program(&mut bus, &[0x0F]);
 
         let result = cpu.step(&mut bus);
 
         assert_eq!(
             result,
             Err(CpuError::UnsupportedOpcode {
-                opcode: 0x06,
+                opcode: 0x0F,
                 cs: 0,
                 ip: 0,
             })
@@ -1006,5 +1567,207 @@ mod tests {
         assert_eq!(cpu.run_steps(&mut bus, 3), Ok(1));
         assert!(cpu.halted);
         assert_eq!(cpu.ip, 1);
+    }
+
+    #[test]
+    fn far_jump_loads_code_segment_and_instruction_pointer() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        write_program(&mut bus, &[0xEA, 0x34, 0x12, 0x78, 0x56]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ip, 0x1234);
+        assert_eq!(cpu.cs, 0x5678);
+    }
+
+    #[test]
+    fn in_reads_byte_from_immediate_port() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        bus.write_port(0xC2, 0x35);
+        write_program(&mut bus, &[0xE4, 0xC2]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ax as u8, 0x35);
+    }
+
+    #[test]
+    fn out_writes_byte_to_immediate_port() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0x0035;
+        write_program(&mut bus, &[0xE6, 0xC2]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_port(0xC2), 0x35);
+    }
+
+    #[test]
+    fn mov_register_to_segment_register_works() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0x1234;
+        write_program(&mut bus, &[0x8E, 0xD8]); // MOV DS, AX
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ds, 0x1234);
+    }
+
+    #[test]
+    fn stosw_writes_ax_to_es_di_and_advances_di() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0x1234;
+        cpu.es = 0;
+        cpu.di = 0x0200;
+        write_program(&mut bus, &[0xAB]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_byte(0x0200), Some(0x34));
+        assert_eq!(bus.read_byte(0x0201), Some(0x12));
+        assert_eq!(cpu.di, 0x0202);
+    }
+
+    #[test]
+    fn rep_stosw_repeats_cx_times_and_clears_cx() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0xBEEF;
+        cpu.es = 0;
+        cpu.di = 0x0200;
+        cpu.cx = 2;
+        write_program(&mut bus, &[0xF3, 0xAB]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_byte(0x0200), Some(0xEF));
+        assert_eq!(bus.read_byte(0x0201), Some(0xBE));
+        assert_eq!(bus.read_byte(0x0202), Some(0xEF));
+        assert_eq!(bus.read_byte(0x0203), Some(0xBE));
+        assert_eq!(cpu.cx, 0);
+        assert_eq!(cpu.di, 0x0204);
+    }
+
+    #[test]
+    fn test_accumulator_updates_flags_without_modifying_accumulator() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0x0002;
+        write_program(&mut bus, &[0xA8, 0x02]); // TEST AL, 02h
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ax, 0x0002);
+        assert_eq!(cpu.flags & FLAG_ZERO, 0);
+    }
+
+    #[test]
+    fn rep_movsw_copies_words_and_updates_indices() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ds = 0;
+        cpu.es = 0;
+        cpu.si = 0x0200;
+        cpu.di = 0x0300;
+        cpu.cx = 2;
+        assert!(bus.write_byte(0x0200, 0x34));
+        assert!(bus.write_byte(0x0201, 0x12));
+        assert!(bus.write_byte(0x0202, 0x78));
+        assert!(bus.write_byte(0x0203, 0x56));
+        write_program(&mut bus, &[0xF3, 0xA5]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_byte(0x0300), Some(0x34));
+        assert_eq!(bus.read_byte(0x0301), Some(0x12));
+        assert_eq!(bus.read_byte(0x0302), Some(0x78));
+        assert_eq!(bus.read_byte(0x0303), Some(0x56));
+        assert_eq!(cpu.si, 0x0204);
+        assert_eq!(cpu.di, 0x0304);
+        assert_eq!(cpu.cx, 0);
+    }
+
+    #[test]
+    fn segment_override_moffs_writes_accumulator_to_selected_segment() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0x005A;
+        cpu.ss = 0x0010;
+        write_program(&mut bus, &[0x36, 0xA2, 0x00, 0x02]); // MOV SS:[0200h], AL
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_byte(0x0300), Some(0x5A));
+        assert_eq!(bus.read_byte(0x0200), Some(0));
+    }
+
+    #[test]
+    fn far_call_and_return_preserve_code_location() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ss = 0;
+        cpu.sp = 0x0200;
+        write_program(&mut bus, &[0x9A, 0x00, 0x01, 0x00, 0x00]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ip, 0x0100);
+        assert_eq!(cpu.cs, 0);
+        assert_eq!(cpu.sp, 0x01FC);
+
+        assert!(bus.write_byte(0x0100, 0xCB));
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ip, 5);
+        assert_eq!(cpu.cs, 0);
+        assert_eq!(cpu.sp, 0x0200);
+    }
+
+    #[test]
+    fn test_modrm_memory_updates_flags_without_writing_memory() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        assert!(bus.write_byte(0x0200, 0x00));
+        assert!(bus.write_byte(0x0201, 0x00));
+        write_program(&mut bus, &[0xF7, 0x06, 0x00, 0x02, 0x00, 0x80]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_ne!(cpu.flags & FLAG_ZERO, 0);
+        assert_eq!(bus.read_byte(0x0200), Some(0x00));
+        assert_eq!(bus.read_byte(0x0201), Some(0x00));
+    }
+
+    #[test]
+    fn push_and_pop_general_register_preserve_value() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.sp = 0x0200;
+        cpu.ax = 0x1234;
+        write_program(&mut bus, &[0x50, 0x58]); // PUSH AX; POP AX
+
+        cpu.step(&mut bus).unwrap();
+        cpu.ax = 0;
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ax, 0x1234);
+        assert_eq!(cpu.sp, 0x0200);
     }
 }

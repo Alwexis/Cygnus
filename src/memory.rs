@@ -12,6 +12,8 @@ const ROM1_END: u32 = 0x3FFFF;
 
 const LINEAR_START: u32 = 0x40000;
 const LINEAR_END: u32 = 0xFFFFF;
+const FIXED_START: u32 = 0xF0000;
+const FIXED_END: u32 = 0xFFFFF;
 
 pub struct Memory {
     cartridge: Cartridge,
@@ -56,6 +58,9 @@ impl Memory {
             }
             ROM1_START..=ROM1_END => {
                 usize::from(self.rom_bank1) * ROM_BANK_SIZE + (address - ROM1_START) as usize
+            }
+            FIXED_START..=FIXED_END => {
+                self.cartridge.size().checked_sub(ROM_BANK_SIZE)? + (address - FIXED_START) as usize
             }
             LINEAR_START..=LINEAR_END => {
                 usize::from(self.linear_bank) * LINEAR_BANK_SIZE
@@ -110,6 +115,14 @@ mod tests {
         memory.set_linear_bank(1);
 
         assert_eq!(memory.read_byte(0x40000), Some(20));
+    }
+
+    #[test]
+    fn fixed_window_maps_last_rom_bank() {
+        let memory = Memory::new(test_cartridge());
+
+        assert_eq!(memory.read_byte(0xF0000), Some(63));
+        assert_eq!(memory.read_byte(0xFFFFF), Some(63));
     }
 
     #[test]
