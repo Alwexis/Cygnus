@@ -6,6 +6,14 @@ pub const PALETTE_END: u8 = 0x3F;
 pub const DISPLAY_CONTROL_PORT: u8 = 0x00;
 pub const BORDER_COLOR_PORT: u8 = 0x01;
 pub const TILE_MAP_PORT: u8 = 0x07;
+pub const FG_WINDOW_LEFT_PORT: u8 = 0x08;
+pub const FG_WINDOW_TOP_PORT: u8 = 0x09;
+pub const FG_WINDOW_RIGHT_PORT: u8 = 0x0A;
+pub const FG_WINDOW_BOTTOM_PORT: u8 = 0x0B;
+pub const SPRITE_WINDOW_LEFT_PORT: u8 = 0x0C;
+pub const SPRITE_WINDOW_TOP_PORT: u8 = 0x0D;
+pub const SPRITE_WINDOW_RIGHT_PORT: u8 = 0x0E;
+pub const SPRITE_WINDOW_BOTTOM_PORT: u8 = 0x0F;
 pub const BG1_SCROLL_X_PORT: u8 = 0x10;
 pub const BG1_SCROLL_Y_PORT: u8 = 0x11;
 pub const BG2_SCROLL_X_PORT: u8 = 0x12;
@@ -112,7 +120,12 @@ impl Video {
             );
         }
         if display_control & 0x04 != 0 {
-            self.render_sprites(ram, false, &mut composed);
+            self.render_sprites(
+                ram,
+                false,
+                display_control & 0x08 != 0,
+                &mut composed,
+            );
         }
         if display_control & 0x02 != 0 {
             self.render_layer(
@@ -125,7 +138,12 @@ impl Video {
             );
         }
         if display_control & 0x04 != 0 {
-            self.render_sprites(ram, true, &mut composed);
+            self.render_sprites(
+                ram,
+                true,
+                display_control & 0x08 != 0,
+                &mut composed,
+            );
         }
         self.framebuffer = composed;
     }
@@ -139,6 +157,7 @@ impl Video {
         transparent_zero: bool,
         target: &mut [u8],
     ) {
+        let window_mode = (self.registers[usize::from(DISPLAY_CONTROL_PORT)] >> 4) & 0x03;
         let scroll_x = usize::from(self.registers[usize::from(scroll_x_port)]);
         let scroll_y = usize::from(self.registers[usize::from(scroll_y_port)]);
         let tile_base = if self.color_control & 0x40 != 0 {
@@ -157,6 +176,9 @@ impl Video {
             let tile_row = (source_y / 8) & 0x1F;
             let pixel_y = source_y & 7;
             for x in 0..SCREEN_WIDTH {
+                if transparent_zero && !self.window_allows(x, y, window_mode, false) {
+                    continue;
+                }
                 let source_x = x + scroll_x;
                 let tile_col = (source_x / 8) & 0x1F;
                 let pixel_x = source_x & 7;
@@ -205,7 +227,13 @@ impl Video {
         }
     }
 
-    fn render_sprites(&self, ram: &[u8], high_priority: bool, target: &mut [u8]) {
+    fn render_sprites(
+        &self,
+        ram: &[u8],
+        high_priority: bool,
+        window_enabled: bool,
+        target: &mut [u8],
+    ) {
         let table_base = usize::from(self.registers[usize::from(SPRITE_TABLE_PORT)] & 0x1F) << 9;
         let tile_base =
             0x4000 + (usize::from(self.registers[usize::from(SPRITE_TILE_BASE_PORT)]) << 2);
@@ -261,7 +289,14 @@ impl Video {
                     }
                     let screen_x = x + pixel_x as i16;
                     if (0..SCREEN_WIDTH as i16).contains(&screen_x) {
-                        target[screen_y as usize * SCREEN_WIDTH + screen_x as usize] =
+                        let screen_x = screen_x as usize;
+                        let screen_y = screen_y as usize;
+                        if window_enabled
+                            && !self.window_allows(screen_x, screen_y, 0, true)
+                        {
+                            continue;
+                        }
+                        target[screen_y * SCREEN_WIDTH + screen_x] =
                             if self.color_control & 0x80 != 0 {
                                 (((palette + 8) << 4) | color as usize) as u8
                             } else {
@@ -269,7 +304,36 @@ impl Video {
                             };
                     }
                 }
+
             }
+        }
+    }
+
+    fn window_allows(&self, x: usize, y: usize, mode: u8, sprite: bool) -> bool {
+        let (left_port, top_port, right_port, bottom_port) = if sprite {
+            (
+                SPRITE_WINDOW_LEFT_PORT,
+                SPRITE_WINDOW_TOP_PORT,
+                SPRITE_WINDOW_RIGHT_PORT,
+                SPRITE_WINDOW_BOTTOM_PORT,
+            )
+        } else {
+            (
+                FG_WINDOW_LEFT_PORT,
+                FG_WINDOW_TOP_PORT,
+                FG_WINDOW_RIGHT_PORT,
+                FG_WINDOW_BOTTOM_PORT,
+            )
+        };
+        let left = usize::from(self.registers[usize::from(left_port)]);
+        let top = usize::from(self.registers[usize::from(top_port)]);
+        let right = usize::from(self.registers[usize::from(right_port)]);
+        let bottom = usize::from(self.registers[usize::from(bottom_port)]);
+        let inside = x >= left && x <= right && y >= top && y <= bottom;
+        match mode {
+            1 => inside,
+            2 => !inside,
+            _ => true,
         }
     }
 }
@@ -387,6 +451,32 @@ mod tests {
 
         assert_eq!(video.pixel(0, 0), Some(3));
         assert_eq!(video.pixel(1, 0), Some(2));
+    }
+
+    #[test]
+    fn foreground_window_limits_foreground_pixels() {
+        let mut video = Video::new();
+        let mut ram = vec![0; 0x10000];
+
+        video.write_port(DISPLAY_CONTROL_PORT, 0x13);
+        video.write_port(COLOR_CONTROL_PORT, 0x40);
+        video.write_port(TILE_MAP_PORT, 0x10);
+        video.write_port(FG_WINDOW_LEFT_PORT, 0);
+        video.write_port(FG_WINDOW_TOP_PORT, 0);
+        video.write_port(FG_WINDOW_RIGHT_PORT, 0);
+        video.write_port(FG_WINDOW_BOTTOM_PORT, 0);
+        ram[0] = 0;
+        ram[1] = 0;
+        ram[0x800] = 1;
+        ram[0x801] = 0;
+        ram[0x4000] = 0xFF;
+        ram[0x4020] = 0x80;
+        ram[0x4021] = 0xC0;
+
+        video.render_background(&ram);
+
+        assert_eq!(video.pixel(0, 0), Some(3));
+        assert_eq!(video.pixel(1, 0), Some(1));
     }
 
     #[test]
