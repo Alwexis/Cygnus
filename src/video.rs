@@ -93,12 +93,14 @@ impl Video {
     }
 
     pub fn render_background(&mut self, ram: &[u8]) {
-        self.clear(self.registers[usize::from(BORDER_COLOR_PORT)] & 0x0F);
+        let border_color = self.registers[usize::from(BORDER_COLOR_PORT)] & 0x0F;
+        self.clear(border_color);
         let display_control = self.registers[usize::from(DISPLAY_CONTROL_PORT)];
         if display_control & 0x07 == 0 {
             return;
         }
 
+        let mut composed = vec![border_color; self.framebuffer.len()];
         if display_control & 0x01 != 0 {
             self.render_layer(
                 ram,
@@ -106,7 +108,11 @@ impl Video {
                 BG1_SCROLL_X_PORT,
                 BG1_SCROLL_Y_PORT,
                 false,
+                &mut composed,
             );
+        }
+        if display_control & 0x04 != 0 {
+            self.render_sprites(ram, false, &mut composed);
         }
         if display_control & 0x02 != 0 {
             self.render_layer(
@@ -115,11 +121,13 @@ impl Video {
                 BG2_SCROLL_X_PORT,
                 BG2_SCROLL_Y_PORT,
                 true,
+                &mut composed,
             );
         }
         if display_control & 0x04 != 0 {
-            self.render_sprites(ram);
+            self.render_sprites(ram, true, &mut composed);
         }
+        self.framebuffer = composed;
     }
 
     fn render_layer(
@@ -129,16 +137,17 @@ impl Video {
         scroll_x_port: u8,
         scroll_y_port: u8,
         transparent_zero: bool,
+        target: &mut [u8],
     ) {
         let scroll_x = usize::from(self.registers[usize::from(scroll_x_port)]);
         let scroll_y = usize::from(self.registers[usize::from(scroll_y_port)]);
         let tile_base = if self.color_control & 0x40 != 0 {
-            0x2000
+            0x4000
         } else {
             0x1000
         };
         let tile_size = if self.color_control & 0x40 != 0 {
-            16
+            32
         } else {
             8
         };
@@ -164,9 +173,9 @@ impl Video {
                 let tile_bank = tile_map & 0x2000 != 0;
                 let flipped_x = tile_map & 0x4000 != 0;
                 let flipped_y = tile_map & 0x8000 != 0;
-                let source_pixel_x = if flipped_x { 7 - pixel_x } else { pixel_x };
+                let source_pixel_x = if flipped_x { pixel_x } else { 7 - pixel_x };
                 let source_pixel_y = if flipped_y { 7 - pixel_y } else { pixel_y };
-                let tile_offset = tile_base + if tile_bank { 0x2000 } else { 0 } + tile * tile_size;
+                let tile_offset = tile_base + if tile_bank { 0x4000 } else { 0 } + tile * tile_size;
                 let color = if self.color_control & 0x40 != 0 {
                     let row_offset = tile_offset + source_pixel_y * 4;
                     let mut color = 0;
@@ -174,7 +183,7 @@ impl Video {
                         let Some(&plane_bits) = ram.get(row_offset + plane) else {
                             continue;
                         };
-                        color |= ((plane_bits >> (7 - source_pixel_x)) & 1) << plane;
+                        color |= ((plane_bits >> source_pixel_x) & 1) << plane;
                     }
                     color
                 } else {
@@ -186,7 +195,7 @@ impl Video {
                     (packed >> (6 - (source_pixel_x & 3) * 2)) & 0x03
                 };
                 if !transparent_zero || color != 0 {
-                    self.framebuffer[y * SCREEN_WIDTH + x] = if self.color_control & 0x80 != 0 {
+                    target[y * SCREEN_WIDTH + x] = if self.color_control & 0x80 != 0 {
                         ((palette << 4) | usize::from(color)) as u8
                     } else {
                         color
@@ -196,10 +205,10 @@ impl Video {
         }
     }
 
-    fn render_sprites(&mut self, ram: &[u8]) {
+    fn render_sprites(&self, ram: &[u8], high_priority: bool, target: &mut [u8]) {
         let table_base = usize::from(self.registers[usize::from(SPRITE_TABLE_PORT)] & 0x1F) << 9;
         let tile_base =
-            0x2000 + (usize::from(self.registers[usize::from(SPRITE_TILE_BASE_PORT)]) << 2);
+            0x4000 + (usize::from(self.registers[usize::from(SPRITE_TILE_BASE_PORT)]) << 2);
         let count = usize::from(self.registers[usize::from(SPRITE_COUNT_PORT)]);
 
         for index in (0..count.min(128)).rev() {
@@ -211,6 +220,9 @@ impl Video {
                 continue;
             };
             let tile_map = u16::from_le_bytes([tile_low, tile_high]);
+            if (tile_map & 0x2000 != 0) != high_priority {
+                continue;
+            }
             let x = i16::from(ram.get(entry + 3).copied().unwrap_or(0) as i8);
             let y = i16::from(ram.get(entry + 2).copied().unwrap_or(0) as i8);
             let tile = usize::from(tile_map & 0x01FF);
@@ -237,8 +249,8 @@ impl Video {
                     continue;
                 };
                 for pixel_x in 0..8 {
-                    let source_x = if flipped_x { 7 - pixel_x } else { pixel_x };
-                    let bit = 7 - source_x;
+                    let source_x = if flipped_x { pixel_x } else { 7 - pixel_x };
+                    let bit = source_x;
                     let color = ((row0 >> bit) & 1)
                         | (((row1 >> bit) & 1) << 1)
                         | (((row2 >> bit) & 1) << 2)
@@ -248,8 +260,7 @@ impl Video {
                     }
                     let screen_x = x + pixel_x as i16;
                     if (0..SCREEN_WIDTH as i16).contains(&screen_x) {
-                        self.framebuffer[screen_y as usize * SCREEN_WIDTH + screen_x as usize] =
-                            color;
+                        target[screen_y as usize * SCREEN_WIDTH + screen_x as usize] = color;
                     }
                 }
             }
@@ -324,8 +335,8 @@ mod tests {
         video.write_port(COLOR_CONTROL_PORT, 0x40);
         ram[0] = 0;
         ram[1] = 0;
-        ram[0x2000] = 0x80;
-        ram[0x2001] = 0x40;
+        ram[0x4000] = 0x80;
+        ram[0x4001] = 0x40;
 
         video.render_background(&ram);
 
@@ -342,7 +353,7 @@ mod tests {
         video.write_port(COLOR_CONTROL_PORT, 0x40);
         ram[0] = 0x00;
         ram[1] = 0x20;
-        ram[0x4000] = 0x80;
+        ram[0x8000] = 0x80;
 
         video.render_background(&ram);
 
@@ -361,10 +372,10 @@ mod tests {
         ram[1] = 0;
         ram[0x800] = 1;
         ram[0x801] = 0;
-        ram[0x2000] = 0x80;
-        ram[0x2001] = 0x40;
-        ram[0x2010] = 0x80;
-        ram[0x2011] = 0xC0;
+        ram[0x4000] = 0x80;
+        ram[0x4001] = 0x40;
+        ram[0x4020] = 0x80;
+        ram[0x4021] = 0xC0;
 
         video.render_background(&ram);
 
@@ -382,10 +393,10 @@ mod tests {
         video.write_port(SPRITE_COUNT_PORT, 1);
         ram[2] = 0;
         ram[3] = 0;
-        ram[0x2000] = 0x80;
-        ram[0x2001] = 0x00;
-        ram[0x2002] = 0x00;
-        ram[0x2003] = 0x00;
+        ram[0x4000] = 0x80;
+        ram[0x4001] = 0x00;
+        ram[0x4002] = 0x00;
+        ram[0x4003] = 0x00;
 
         video.render_background(&ram);
 
