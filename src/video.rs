@@ -226,6 +226,7 @@ impl Video {
             let x = i16::from(ram.get(entry + 3).copied().unwrap_or(0) as i8);
             let y = i16::from(ram.get(entry + 2).copied().unwrap_or(0) as i8);
             let tile = usize::from(tile_map & 0x01FF);
+            let palette = usize::from((tile_map >> 9) & 0x07);
             let flipped_x = tile_map & 0x4000 != 0;
             let flipped_y = tile_map & 0x8000 != 0;
             let tile_offset = tile_base + tile * 32;
@@ -260,7 +261,12 @@ impl Video {
                     }
                     let screen_x = x + pixel_x as i16;
                     if (0..SCREEN_WIDTH as i16).contains(&screen_x) {
-                        target[screen_y as usize * SCREEN_WIDTH + screen_x as usize] = color;
+                        target[screen_y as usize * SCREEN_WIDTH + screen_x as usize] =
+                            if self.color_control & 0x80 != 0 {
+                                (((palette + 8) << 4) | color as usize) as u8
+                            } else {
+                                color
+                            };
                     }
                 }
             }
@@ -401,5 +407,22 @@ mod tests {
         video.render_background(&ram);
 
         assert_eq!(video.pixel(0, 0), Some(1));
+    }
+
+    #[test]
+    fn color_sprite_uses_sprite_palette_range() {
+        let mut video = Video::new();
+        let mut ram = vec![0; 0x10000];
+
+        video.write_port(DISPLAY_CONTROL_PORT, 0x04);
+        video.write_port(COLOR_CONTROL_PORT, 0xC0);
+        video.write_port(SPRITE_COUNT_PORT, 1);
+        ram[2] = 0;
+        ram[3] = 0x00;
+        ram[0x4000] = 0x80;
+
+        video.render_background(&ram);
+
+        assert_eq!(video.pixel(0, 0), Some(0x81));
     }
 }
