@@ -79,7 +79,7 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut trace = Vec::with_capacity(32);
     let mut executed = 0;
     let result = loop {
-        if executed == 100_000 || cpu.halted {
+        if executed == 1_000_000 || cpu.halted {
             break Ok(());
         }
         match cpu.trace_step(&mut bus) {

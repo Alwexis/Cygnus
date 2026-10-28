@@ -20,6 +20,7 @@ const ARITHMETIC_FLAGS: u16 =
 pub enum CpuError {
     UnmappedMemory(u32),
     UnsupportedOpcode { opcode: u8, cs: u16, ip: u16 },
+    DivisionError { opcode: u8, cs: u16, ip: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,19 +192,12 @@ impl Cpu {
         let modrm = self.fetch_byte(bus)?;
         let mode = modrm >> 6;
         let operation = (modrm >> 3) & 7;
-        let width = if opcode == 0xD0 || opcode == 0xC0 {
+        let width = if opcode == 0xD0 || opcode == 0xC0 || opcode == 0xD2 {
             8
         } else {
             16
         };
-        let count = if opcode == 0xC0 || opcode == 0xC1 {
-            self.fetch_byte(bus)? & 0x1F
-        } else {
-            1
-        };
-        let count = count % width;
-
-        if !matches!(operation, 4 | 5) || mode != 0b11 || count == 0 {
+        if !matches!(operation, 0 | 1 | 4 | 5) {
             return Err(CpuError::UnsupportedOpcode {
                 opcode,
                 cs: self.cs,
@@ -211,25 +205,67 @@ impl Cpu {
             });
         }
 
-        let value = if width == 8 {
+        let memory_address = if mode == 0b11 {
+            None
+        } else {
+            Some(self.decode_memory_address(bus, modrm)?)
+        };
+        let count = if opcode == 0xC0 || opcode == 0xC1 {
+            self.fetch_byte(bus)? & 0x1F
+        } else if opcode == 0xD2 || opcode == 0xD3 {
+            self.get_register8(1) & 0x1F
+        } else {
+            1
+        };
+        let count = count % width;
+
+        if count == 0 {
+            return Ok(());
+        }
+
+        let value = if let Some((segment, offset)) = memory_address {
+            if width == 8 {
+                u16::from(self.read_memory_byte(bus, segment, offset)?)
+            } else {
+                self.read_memory_word(bus, segment, offset)?
+            }
+        } else if width == 8 {
             u16::from(self.get_register8(modrm & 7))
         } else {
             self.get_register16(modrm & 7)
         };
         let result = if operation == 4 {
             value << count
-        } else {
+        } else if operation == 5 {
             value >> count
+        } else if operation == 0 {
+            ((value << count) | (value >> (width - count))) & ((1 << width) - 1)
+        } else {
+            (value >> count) | (value << (width - count))
         };
         let carry_bit = if operation == 4 {
             (value >> (width - count)) & 1
-        } else {
+        } else if operation == 5 {
             (value >> (count - 1)) & 1
+        } else if operation == 0 {
+            result & 1
+        } else {
+            (result >> (width - 1)) & 1
         };
-        self.set_flag(FLAG_CARRY, carry_bit != 0);
-        self.update_common_flags(result, width);
+        if operation == 0 || operation == 1 {
+            self.set_flag(FLAG_CARRY, carry_bit != 0);
+        } else {
+            self.set_flag(FLAG_CARRY, carry_bit != 0);
+            self.update_common_flags(result, width);
+        }
 
-        if width == 8 {
+        if let Some((segment, offset)) = memory_address {
+            if width == 8 {
+                self.write_memory_byte(bus, segment, offset, result as u8)?;
+            } else {
+                self.write_memory_word(bus, segment, offset, result)?;
+            }
+        } else if width == 8 {
             self.set_register8(modrm & 7, result as u8);
         } else {
             self.set_register16(modrm & 7, result);
@@ -307,7 +343,8 @@ impl Cpu {
 
     fn execute_ff_modrm(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
         let modrm = self.fetch_byte(bus)?;
-        if (modrm >> 3) & 7 != 3 || modrm >> 6 == 0b11 {
+        let operation = (modrm >> 3) & 7;
+        if !matches!(operation, 0 | 1 | 2 | 3 | 4 | 5 | 6) {
             return Err(CpuError::UnsupportedOpcode {
                 opcode: 0xFF,
                 cs: self.cs,
@@ -315,13 +352,82 @@ impl Cpu {
             });
         }
 
-        let (segment, offset) = self.decode_memory_address(bus, modrm)?;
-        let target_offset = self.read_memory_word(bus, segment, offset)?;
-        let target_segment = self.read_memory_word(bus, segment, offset.wrapping_add(2))?;
-        self.push_word(bus, self.cs)?;
-        self.push_word(bus, self.ip)?;
-        self.ip = target_offset;
-        self.cs = target_segment;
+        if operation == 0 || operation == 1 {
+            let carry = self.flags & FLAG_CARRY;
+            let memory_address = if modrm >> 6 == 0b11 {
+                None
+            } else {
+                Some(self.decode_memory_address(bus, modrm)?)
+            };
+            let value = if let Some((segment, offset)) = memory_address {
+                self.read_memory_word(bus, segment, offset)?
+            } else {
+                self.get_register16(modrm & 7)
+            };
+            let result = if operation == 0 {
+                self.execute_alu(AluOperation::Add, value, 1, 16)
+            } else {
+                self.execute_alu(AluOperation::Sub, value, 1, 16)
+            };
+            self.flags = (self.flags & !FLAG_CARRY) | carry | FLAG_RESERVED;
+            if let Some((segment, offset)) = memory_address {
+                self.write_memory_word(bus, segment, offset, result)?;
+            } else {
+                self.set_register16(modrm & 7, result);
+            }
+            return Ok(());
+        }
+
+        let memory_address = if modrm >> 6 == 0b11 {
+            None
+        } else {
+            Some(self.decode_memory_address(bus, modrm)?)
+        };
+        let target_offset = if let Some((segment, offset)) = memory_address {
+            self.read_memory_word(bus, segment, offset)?
+        } else {
+            self.get_register16(modrm & 7)
+        };
+
+        match operation {
+            2 => {
+                self.push_word(bus, self.ip)?;
+                self.ip = target_offset;
+            }
+            4 => {
+                self.ip = target_offset;
+            }
+            6 => {
+                self.push_word(bus, target_offset)?;
+            }
+            3 | 5 => {
+                let (segment, offset) = memory_address.ok_or(CpuError::UnsupportedOpcode {
+                    opcode: 0xFF,
+                    cs: self.cs,
+                    ip: self.ip.wrapping_sub(2),
+                })?;
+                let target_segment = self.read_memory_word(bus, segment, offset.wrapping_add(2))?;
+                if operation == 3 {
+                    self.push_word(bus, self.cs)?;
+                    self.push_word(bus, self.ip)?;
+                }
+                self.ip = target_offset;
+                self.cs = target_segment;
+            }
+            _ => unreachable!(),
+        }
+
+        if matches!(operation, 2 | 4 | 6) {
+            return Ok(());
+        }
+
+        if memory_address.is_none() {
+            return Err(CpuError::UnsupportedOpcode {
+                opcode: 0xFF,
+                cs: self.cs,
+                ip: self.ip.wrapping_sub(2),
+            });
+        }
         Ok(())
     }
 
@@ -957,6 +1063,51 @@ impl Cpu {
             return Ok(());
         }
 
+        if reg == 6 {
+            let divisor = if mode == 0b11 {
+                if width == 8 {
+                    u16::from(self.get_register8(modrm & 7))
+                } else {
+                    self.get_register16(modrm & 7)
+                }
+            } else {
+                let (segment, offset) = self.decode_memory_address(bus, modrm)?;
+                if width == 8 {
+                    u16::from(self.read_memory_byte(bus, segment, offset)?)
+                } else {
+                    self.read_memory_word(bus, segment, offset)?
+                }
+            };
+            let error = || CpuError::DivisionError {
+                opcode,
+                cs: self.cs,
+                ip: self.ip.wrapping_sub(2),
+            };
+
+            if divisor == 0 {
+                return Err(error());
+            }
+
+            if width == 8 {
+                let dividend = u16::from(self.ax);
+                let quotient = dividend / divisor;
+                if quotient > u16::from(u8::MAX) {
+                    return Err(error());
+                }
+                self.set_register8(0, quotient as u8);
+                self.set_register8(4, (dividend % divisor) as u8);
+            } else {
+                let dividend = (u32::from(self.dx) << 16) | u32::from(self.ax);
+                let quotient = dividend / u32::from(divisor);
+                if quotient > u32::from(u16::MAX) {
+                    return Err(error());
+                }
+                self.ax = quotient as u16;
+                self.dx = (dividend % u32::from(divisor)) as u16;
+            }
+            return Ok(());
+        }
+
         if reg != 0 {
             return Err(CpuError::UnsupportedOpcode {
                 opcode,
@@ -1097,7 +1248,7 @@ impl Cpu {
             0xF6 | 0xF7 => self.execute_test_modrm(bus, opcode)?,
 
             // SHR r/m8,1; SHR r/m16,1
-            0xC0 | 0xC1 | 0xD0 | 0xD1 => self.execute_shift_modrm(bus, opcode)?,
+            0xC0 | 0xC1 | 0xD0 | 0xD1 | 0xD2 | 0xD3 => self.execute_shift_modrm(bus, opcode)?,
 
             // LOOP rel8
             0xE2 => {
@@ -2218,6 +2369,82 @@ mod tests {
         cpu.step(&mut bus).unwrap();
 
         assert_eq!(cpu.ip, 4);
+    }
+
+    #[test]
+    fn shift_left_register_by_cl_count() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 1;
+        cpu.cx = 3;
+        write_program(&mut bus, &[0xD3, 0xE0]); // SHL AX,CL
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ax, 8);
+    }
+
+    #[test]
+    fn shift_by_zero_leaves_register_and_flags_unchanged() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0x1234;
+        cpu.cx = 0;
+        cpu.flags = FLAG_CARRY | FLAG_ZERO;
+        write_program(&mut bus, &[0xD3, 0xE0]); // SHL AX,CL
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ax, 0x1234);
+        assert_eq!(cpu.flags, FLAG_CARRY | FLAG_ZERO);
+    }
+
+    #[test]
+    fn rotate_left_byte_in_memory_by_immediate_count() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        assert!(bus.write_byte(0x0200, 0x81));
+        write_program(&mut bus, &[0xC0, 0x06, 0x00, 0x02, 0x01]); // ROL [0200],1
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_byte(0x0200), Some(0x03));
+    }
+
+    #[test]
+    fn divide_word_uses_dx_ax_and_writes_quotient_and_remainder() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 10;
+        cpu.dx = 0;
+        cpu.bx = 3;
+        write_program(&mut bus, &[0xF7, 0xF3]); // DIV BX
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ax, 3);
+        assert_eq!(cpu.dx, 1);
+    }
+
+    #[test]
+    fn inc_word_in_memory_preserves_carry() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        assert!(bus.write_byte(0x0200, 0xFF));
+        assert!(bus.write_byte(0x0201, 0x00));
+        cpu.flags = FLAG_CARRY;
+        write_program(&mut bus, &[0xFF, 0x06, 0x00, 0x02]); // INC word [0200]
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_byte(0x0200), Some(0x00));
+        assert_eq!(bus.read_byte(0x0201), Some(0x01));
+        assert_ne!(cpu.flags & FLAG_CARRY, 0);
     }
 
     #[test]
