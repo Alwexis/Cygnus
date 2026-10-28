@@ -1,5 +1,6 @@
 use crate::keyboard::Keyboard;
 use crate::keypad::Keypad;
+use crate::video::Video;
 
 const KEYPAD_PORT: u8 = 0xB5;
 
@@ -30,6 +31,7 @@ const TOTAL_SCANLINES: u16 = 159;
 pub struct IO {
     keyboard: Keyboard,
     keypad: Keypad,
+    video: Video,
     timer: Timer,
     pending_interrupt: Option<u8>,
     timer_control: u8,
@@ -95,6 +97,12 @@ impl Timer {
 }
 
 impl IO {
+    fn is_video_register(port: u8) -> bool {
+        usize::from(port) < crate::video::VIDEO_REGISTER_COUNT
+            && port != SCANLINE_PORT
+            && port != SCANLINE_CONTROL_PORT
+    }
+
     pub fn new() -> Self {
         Self::new_with_linear_bank(0)
     }
@@ -103,6 +111,7 @@ impl IO {
         Self {
             keyboard: Keyboard::new(),
             keypad: Keypad::new(),
+            video: Video::new(),
             timer: Timer::new(),
             pending_interrupt: None,
             timer_control: 0,
@@ -126,6 +135,14 @@ impl IO {
 
     pub fn keyboard_mut(&mut self) -> &mut Keyboard {
         &mut self.keyboard
+    }
+
+    pub fn video(&self) -> &Video {
+        &self.video
+    }
+
+    pub fn video_mut(&mut self) -> &mut Video {
+        &mut self.video
     }
 
     pub fn configure_timer(&mut self, period: u32, vector: u8) {
@@ -194,6 +211,10 @@ impl IO {
     }
 
     pub fn read_port(&self, port: u8) -> u8 {
+        if Self::is_video_register(port) {
+            return self.video.read_port(port);
+        }
+
         match port {
             KEYPAD_PORT => (self.keypad.read_inputs(&self.keyboard) >> 8) as u8,
             ROM_LINEAR_BANK_PORT => self.rom_linear_bank,
@@ -222,6 +243,11 @@ impl IO {
     }
 
     pub fn write_port(&mut self, port: u8, value: u8) {
+        if Self::is_video_register(port) {
+            self.video.write_port(port, value);
+            return;
+        }
+
         match port {
             KEYPAD_PORT => {
                 self.keypad.write_selection((value as u16) << 8);
@@ -326,7 +352,7 @@ mod tests {
     fn test_unknown_port_reads_ff() {
         let io = IO::new();
 
-        assert_eq!(io.read_port(0x00), 0xFF);
+        assert_eq!(io.read_port(0x70), 0xFF);
     }
 
     #[test]
@@ -337,6 +363,16 @@ mod tests {
         io.write_port(0xB5, 0x40);
 
         assert_eq!(io.read_port(0xB5), 0x44);
+    }
+
+    #[test]
+    fn video_ports_are_backed_by_video_registers() {
+        let mut io = IO::new();
+
+        io.write_port(0x10, 0xA5);
+
+        assert_eq!(io.read_port(0x10), 0xA5);
+        assert_eq!(io.video().read_port(0x10), 0xA5);
     }
 
     #[test]

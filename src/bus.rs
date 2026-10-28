@@ -129,6 +129,10 @@ impl Bus {
     pub fn keyboard_mut(&mut self) -> &mut crate::keyboard::Keyboard {
         self.io.keyboard_mut()
     }
+
+    pub fn framebuffer(&self) -> &[u8] {
+        self.io.video().framebuffer()
+    }
 }
 
 #[cfg(test)]

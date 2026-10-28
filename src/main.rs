@@ -5,6 +5,7 @@ mod io;
 mod keyboard;
 mod keypad;
 mod memory;
+mod video;
 
 use bus::Bus;
 use cartridge::Cartridge;
