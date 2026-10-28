@@ -13,9 +13,19 @@ const VERTICAL_TIMER_PORT: u8 = 0xA6;
 const IRQ_BASE_PORT: u8 = 0xB0;
 const IRQ_ENABLE_PORT: u8 = 0xB2;
 const IRQ_ACK_PORT: u8 = 0xB6;
+const SCANLINE_PORT: u8 = 0x02;
+const SCANLINE_CONTROL_PORT: u8 = 0x03;
+const HORIZONTAL_COUNTER_PORT: u8 = 0xA8;
+const HORIZONTAL_COUNTER_HIGH_PORT: u8 = 0xA9;
+const VERTICAL_COUNTER_PORT: u8 = 0xAA;
+const VERTICAL_COUNTER_MIDDLE_PORT: u8 = 0xAB;
+const VERTICAL_COUNTER_HIGH_PORT: u8 = 0xAC;
 
 const VERTICAL_TIMER_IRQ: u8 = 0x20;
 const HORIZONTAL_TIMER_IRQ: u8 = 0x80;
+const CYCLES_PER_SCANLINE: u32 = 256;
+const VISIBLE_SCANLINES: u16 = 144;
+const TOTAL_SCANLINES: u16 = 159;
 
 pub struct IO {
     keyboard: Keyboard,
@@ -29,6 +39,11 @@ pub struct IO {
     irq_enable: u8,
     irq_ack: u8,
     direct_timer: bool,
+    video_cycles: u32,
+    scanline: u16,
+    scanline_control: u8,
+    horizontal_counter: u16,
+    vertical_counter: u32,
 
     rom_linear_bank: u8,
     ram_bank: u8,
@@ -97,6 +112,11 @@ impl IO {
             irq_enable: 0,
             irq_ack: 0,
             direct_timer: false,
+            video_cycles: 0,
+            scanline: 0,
+            scanline_control: 0,
+            horizontal_counter: 0,
+            vertical_counter: 0,
             rom_linear_bank: linear_bank,
             ram_bank: 0,
             rom_bank0: 0,
@@ -119,6 +139,24 @@ impl IO {
                 self.pending_interrupt = Some(vector);
             } else {
                 self.raise_interrupt(vector);
+            }
+        }
+
+        self.video_cycles += cycles;
+        while self.video_cycles >= CYCLES_PER_SCANLINE {
+            self.video_cycles -= CYCLES_PER_SCANLINE;
+            self.horizontal_counter = self.horizontal_counter.wrapping_add(1);
+            self.scanline = self.scanline.wrapping_add(1);
+            self.vertical_counter = self.vertical_counter.wrapping_add(1);
+
+            if self.irq_enable & HORIZONTAL_TIMER_IRQ != 0 {
+                self.raise_interrupt(HORIZONTAL_TIMER_IRQ);
+            }
+            if self.scanline == VISIBLE_SCANLINES && self.irq_enable & VERTICAL_TIMER_IRQ != 0 {
+                self.raise_interrupt(VERTICAL_TIMER_IRQ);
+            }
+            if self.scanline >= TOTAL_SCANLINES {
+                self.scanline = 0;
             }
         }
     }
@@ -172,6 +210,13 @@ impl IO {
             IRQ_BASE_PORT => self.irq_base,
             IRQ_ENABLE_PORT => self.irq_enable,
             IRQ_ACK_PORT => self.irq_ack,
+            SCANLINE_PORT => self.scanline as u8,
+            SCANLINE_CONTROL_PORT => self.scanline_control,
+            HORIZONTAL_COUNTER_PORT => self.horizontal_counter as u8,
+            HORIZONTAL_COUNTER_HIGH_PORT => (self.horizontal_counter >> 8) as u8,
+            VERTICAL_COUNTER_PORT => self.vertical_counter as u8,
+            VERTICAL_COUNTER_MIDDLE_PORT => (self.vertical_counter >> 8) as u8,
+            VERTICAL_COUNTER_HIGH_PORT => (self.vertical_counter >> 16) as u8,
             _ => 0xFF,
         }
     }
@@ -225,6 +270,26 @@ impl IO {
             IRQ_BASE_PORT => self.irq_base = value,
             IRQ_ENABLE_PORT => self.irq_enable = value,
             IRQ_ACK_PORT => self.irq_ack &= !value,
+            SCANLINE_PORT => self.scanline = u16::from(value) % TOTAL_SCANLINES,
+            SCANLINE_CONTROL_PORT => self.scanline_control = value,
+            HORIZONTAL_COUNTER_PORT => {
+                self.horizontal_counter = (self.horizontal_counter & 0xFF00) | u16::from(value);
+            }
+            HORIZONTAL_COUNTER_HIGH_PORT => {
+                self.horizontal_counter =
+                    (self.horizontal_counter & 0x00FF) | (u16::from(value) << 8);
+            }
+            VERTICAL_COUNTER_PORT => {
+                self.vertical_counter = (self.vertical_counter & 0xFFFF00) | u32::from(value);
+            }
+            VERTICAL_COUNTER_MIDDLE_PORT => {
+                self.vertical_counter =
+                    (self.vertical_counter & 0xFF00FF) | (u32::from(value) << 8);
+            }
+            VERTICAL_COUNTER_HIGH_PORT => {
+                self.vertical_counter =
+                    (self.vertical_counter & 0x00FFFF) | (u32::from(value) << 16);
+            }
             _ => {}
         }
     }
@@ -313,5 +378,28 @@ mod tests {
         io.write_port(IRQ_ACK_PORT, VERTICAL_TIMER_IRQ);
 
         assert_eq!(io.read_port(IRQ_ACK_PORT), HORIZONTAL_TIMER_IRQ);
+    }
+
+    #[test]
+    fn video_clock_advances_scanlines_and_raises_vblank_irq() {
+        let mut io = IO::new();
+
+        io.write_port(IRQ_BASE_PORT, 0x10);
+        io.write_port(IRQ_ENABLE_PORT, VERTICAL_TIMER_IRQ);
+        io.tick(CYCLES_PER_SCANLINE * u32::from(VISIBLE_SCANLINES));
+
+        assert_eq!(io.read_port(SCANLINE_PORT), VISIBLE_SCANLINES as u8);
+        assert_eq!(io.read_port(VERTICAL_COUNTER_PORT), VISIBLE_SCANLINES as u8);
+        assert_eq!(io.take_pending_interrupt(), Some(0x15));
+        assert_eq!(io.read_port(IRQ_ACK_PORT), VERTICAL_TIMER_IRQ);
+    }
+
+    #[test]
+    fn video_clock_wraps_after_total_scanlines() {
+        let mut io = IO::new();
+
+        io.tick(CYCLES_PER_SCANLINE * u32::from(TOTAL_SCANLINES));
+
+        assert_eq!(io.read_port(SCANLINE_PORT), 0);
     }
 }
