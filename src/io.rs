@@ -23,6 +23,7 @@ const VERTICAL_COUNTER_MIDDLE_PORT: u8 = 0xAB;
 const VERTICAL_COUNTER_HIGH_PORT: u8 = 0xAC;
 
 const VERTICAL_TIMER_IRQ: u8 = 0x20;
+const VERTICAL_BLANK_IRQ: u8 = 0x40;
 const HORIZONTAL_TIMER_IRQ: u8 = 0x80;
 const CYCLES_PER_SCANLINE: u32 = 256;
 const VISIBLE_SCANLINES: u16 = 144;
@@ -52,6 +53,10 @@ pub struct IO {
     ram_bank: u8,
     rom_bank0: u8,
     rom_bank1: u8,
+    dma_source: u32,
+    dma_destination: u16,
+    dma_count: u16,
+    dma_control: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -132,6 +137,10 @@ impl IO {
             ram_bank: 0,
             rom_bank0: 0,
             rom_bank1: 1,
+            dma_source: 0,
+            dma_destination: 0,
+            dma_count: 0,
+            dma_control: 0,
         }
     }
 
@@ -171,8 +180,8 @@ impl IO {
             if self.irq_enable & HORIZONTAL_TIMER_IRQ != 0 {
                 self.raise_interrupt(HORIZONTAL_TIMER_IRQ);
             }
-            if self.scanline == VISIBLE_SCANLINES && self.irq_enable & VERTICAL_TIMER_IRQ != 0 {
-                self.raise_interrupt(VERTICAL_TIMER_IRQ);
+            if self.scanline == VISIBLE_SCANLINES && self.irq_enable & VERTICAL_BLANK_IRQ != 0 {
+                self.raise_interrupt(VERTICAL_BLANK_IRQ);
             }
             if self.scanline >= TOTAL_SCANLINES {
                 self.scanline = 0;
@@ -247,6 +256,10 @@ impl IO {
             VERTICAL_COUNTER_PORT => self.vertical_counter as u8,
             VERTICAL_COUNTER_MIDDLE_PORT => (self.vertical_counter >> 8) as u8,
             VERTICAL_COUNTER_HIGH_PORT => (self.vertical_counter >> 16) as u8,
+            0x40..=0x43 => (self.dma_source >> ((port - 0x40) * 8)) as u8,
+            0x44..=0x45 => (self.dma_destination >> ((port - 0x44) * 8)) as u8,
+            0x46..=0x47 => (self.dma_count >> ((port - 0x46) * 8)) as u8,
+            0x48 => self.dma_control,
             _ => 0xFF,
         }
     }
@@ -325,8 +338,37 @@ impl IO {
                 self.vertical_counter =
                     (self.vertical_counter & 0x00FFFF) | (u32::from(value) << 16);
             }
+            0x40..=0x43 => {
+                let shift = (port - 0x40) * 8;
+                self.dma_source =
+                    (self.dma_source & !(0xFF << shift)) | (u32::from(value) << shift);
+            }
+            0x44..=0x45 => {
+                let shift = (port - 0x44) * 8;
+                self.dma_destination =
+                    (self.dma_destination & !(0xFF << shift)) | (u16::from(value) << shift);
+            }
+            0x46..=0x47 => {
+                let shift = (port - 0x46) * 8;
+                self.dma_count = (self.dma_count & !(0xFF << shift)) | (u16::from(value) << shift);
+            }
+            0x48 => self.dma_control = value,
             _ => {}
         }
+    }
+
+    pub fn dma_transfer(&mut self) -> Option<(u32, u16, u16)> {
+        if self.dma_control & 0x80 == 0 {
+            return None;
+        }
+        self.dma_control &= 0x7F;
+        Some((self.dma_source, self.dma_destination, self.dma_count))
+    }
+
+    pub fn complete_dma(&mut self, source: u32, destination: u16) {
+        self.dma_source = source & 0xFFFFF;
+        self.dma_destination = destination;
+        self.dma_count = 0;
     }
 }
 
@@ -439,13 +481,13 @@ mod tests {
         let mut io = IO::new();
 
         io.write_port(IRQ_BASE_PORT, 0x10);
-        io.write_port(IRQ_ENABLE_PORT, VERTICAL_TIMER_IRQ);
+        io.write_port(IRQ_ENABLE_PORT, VERTICAL_BLANK_IRQ);
         io.tick(CYCLES_PER_SCANLINE * u32::from(VISIBLE_SCANLINES));
 
         assert_eq!(io.read_port(SCANLINE_PORT), VISIBLE_SCANLINES as u8);
         assert_eq!(io.read_port(VERTICAL_COUNTER_PORT), VISIBLE_SCANLINES as u8);
-        assert_eq!(io.take_pending_interrupt(), Some(0x15));
-        assert_eq!(io.read_port(IRQ_ACK_PORT), VERTICAL_TIMER_IRQ);
+        assert_eq!(io.take_pending_interrupt(), Some(0x16));
+        assert_eq!(io.read_port(IRQ_ACK_PORT), VERTICAL_BLANK_IRQ);
     }
 
     #[test]

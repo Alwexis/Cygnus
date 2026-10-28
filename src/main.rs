@@ -19,18 +19,26 @@ use std::time::Duration;
 
 const MAX_INSTRUCTIONS: u64 = 1_000_000;
 const DISPLAY_UPDATE_INTERVAL: u64 = 10_000;
+const DEBUG_INTERVAL: u64 = 100_000;
 
 fn main() {
     let mut args = env::args();
     let program_name = args.next().unwrap_or_else(|| "cygnus".to_string());
 
-    if let Some(path) = args.next() {
-        if args.next().is_some() {
-            eprintln!("Uso: {} [ruta_de_la_rom.wsc]", program_name);
+    if let Some(first_argument) = args.next() {
+        let headless = first_argument == "--headless";
+        let path = if headless {
+            args.next()
+        } else {
+            Some(first_argument)
+        };
+
+        if args.next().is_some() || path.is_none() {
+            eprintln!("Uso: {} [--headless] <ruta_de_la_rom.wsc>", program_name);
             process::exit(1);
         }
 
-        if let Err(error) = load_cartridge(&path) {
+        if let Err(error) = load_cartridge(path.as_deref().unwrap(), !headless) {
             eprintln!("Error al cargar el cartucho: {}", error);
             process::exit(1);
         }
@@ -41,7 +49,7 @@ fn main() {
     run_keyboard_demo();
 }
 
-fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn load_cartridge(path: &str, show_window: bool) -> Result<(), Box<dyn std::error::Error>> {
     let cartridge = Cartridge::load(path)?;
 
     println!("Cartucho cargado: {}", path);
@@ -78,16 +86,21 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut cpu = Cpu::new();
-    let mut window = Window::new(
-        "Cygnus - WonderSwan Color",
-        video::SCREEN_WIDTH,
-        video::SCREEN_HEIGHT,
-        WindowOptions {
-            scale: Scale::X4,
-            ..WindowOptions::default()
-        },
-    )?;
-    window.set_target_fps(60);
+    let mut window = if show_window {
+        let mut window = Window::new(
+            "Cygnus - WonderSwan Color",
+            video::SCREEN_WIDTH,
+            video::SCREEN_HEIGHT,
+            WindowOptions {
+                scale: Scale::X4,
+                ..WindowOptions::default()
+            },
+        )?;
+        window.set_target_fps(60);
+        Some(window)
+    } else {
+        None
+    };
 
     println!(
         "\nEjecutando CPU desde el vector de reset físico {:#07X}...",
@@ -97,7 +110,10 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut trace = Vec::with_capacity(32);
     let mut executed = 0u64;
     let result = loop {
-        if executed >= MAX_INSTRUCTIONS || cpu.halted || !window.is_open() {
+        if executed >= MAX_INSTRUCTIONS
+            || cpu.halted
+            || window.as_ref().is_some_and(|window| !window.is_open())
+        {
             break Ok(());
         }
         match cpu.trace_step(&mut bus) {
@@ -108,16 +124,25 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 trace.push(entry);
                 executed += 1;
                 if executed % DISPLAY_UPDATE_INTERVAL == 0 {
-                    update_window(&mut window, bus.framebuffer())?;
+                    if let Some(window) = window.as_mut() {
+                        update_window(window, bus.framebuffer(), &bus)?;
+                    }
+                }
+                if executed % DEBUG_INTERVAL == 0 {
+                    print_debug_status(executed, &cpu, &bus, entry.opcode);
                 }
             }
             Err(error) => break Err(error),
         }
     };
-    update_window(&mut window, bus.framebuffer())?;
-    while window.is_open() {
-        window.update();
-        thread::sleep(Duration::from_millis(16));
+    if let Some(window) = window.as_mut() {
+        update_window(window, bus.framebuffer(), &bus)?;
+    }
+    if let Some(window) = window.as_mut() {
+        while window.is_open() {
+            window.update();
+            thread::sleep(Duration::from_millis(16));
+        }
     }
 
     match result {
@@ -148,15 +173,104 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn update_window(window: &mut Window, framebuffer: &[u8]) -> Result<(), minifb::Error> {
+fn update_window(window: &mut Window, framebuffer: &[u8], bus: &Bus) -> Result<(), minifb::Error> {
     let mut pixels = vec![0; video::SCREEN_WIDTH * video::SCREEN_HEIGHT];
     for (pixel, &color) in pixels.iter_mut().zip(framebuffer) {
-        let intensity = u32::from(color & 0x0F) * 17;
-        *pixel = (intensity << 16) | (intensity << 8) | intensity;
+        *pixel = bus.palette_color(usize::from(color));
     }
 
     window.update_with_buffer(&pixels, video::SCREEN_WIDTH, video::SCREEN_HEIGHT)?;
     Ok(())
+}
+
+fn print_debug_status(executed: u64, cpu: &Cpu, bus: &Bus, opcode: u8) {
+    let framebuffer = bus.framebuffer();
+    let nonzero_pixels = framebuffer.iter().filter(|&&pixel| pixel != 0).count();
+    let max_color = framebuffer.iter().copied().max().unwrap_or(0);
+    let palette = (0..16)
+        .map(|index| format!("{:03X}", bus.palette_color(index)))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    println!(
+        "\n[debug] instrucciones={} CPU={:04X}:{:04X} AX={:04X} CX={:04X} DI={:04X} SS:0140={:#04X} flags={:#06X} opcode={:#04X} halted={}",
+        executed,
+        cpu.cs,
+        cpu.ip,
+        cpu.ax,
+        cpu.cx,
+        cpu.di,
+        bus.read_byte(Cpu::physical_address(cpu.ss, 0x0140))
+            .unwrap_or(0xFF),
+        cpu.flags,
+        opcode,
+        cpu.halted
+    );
+    println!(
+        "[debug] bancos C0={:#04X} C1={:#04X} C2={:#04X} C3={:#04X}",
+        bus.read_port(0xC0),
+        bus.read_port(0xC1),
+        bus.read_port(0xC2),
+        bus.read_port(0xC3)
+    );
+    println!(
+        "[debug] video display={:#04X} border={:#04X} map={:#04X} lcd={:#04X} color={:#04X} scroll=({},{}),({}, {})",
+        bus.read_port(0x00),
+        bus.read_port(0x01),
+        bus.read_port(0x07),
+        bus.read_port(0x14),
+        bus.read_port(0x60),
+        bus.read_port(0x10),
+        bus.read_port(0x11),
+        bus.read_port(0x12),
+        bus.read_port(0x13)
+    );
+    println!(
+        "[debug] irq base={:#04X} enable={:#04X} ack={:#04X} scanline={:#04X}",
+        bus.read_port(0xB0),
+        bus.read_port(0xB2),
+        bus.read_port(0xB6),
+        bus.read_port(0x02)
+    );
+    println!(
+        "[debug] sprites table={:#04X} tile_base={:#04X} count={:#04X} pixels_no_cero={} max_indice={:#X}",
+        bus.read_port(0x04),
+        bus.read_port(0x05),
+        bus.read_port(0x06),
+        nonzero_pixels,
+        max_color
+    );
+    println!("[debug] paleta RGB12: {}", palette);
+    let writes = bus
+        .video_writes()
+        .iter()
+        .map(|(port, value)| format!("{:#04X}={:#04X}", port, value))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let counts = bus
+        .video_write_counts()
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count != 0)
+        .map(|(port, count)| format!("{:#04X}:{}", port, count))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "[debug] escrituras_video por puerto: {}",
+        if counts.is_empty() {
+            "(ninguna)"
+        } else {
+            &counts
+        }
+    );
+    println!(
+        "[debug] primeras_escrituras_video: {}",
+        if writes.is_empty() {
+            "(ninguna)"
+        } else {
+            &writes
+        }
+    );
 }
 
 fn run_keyboard_demo() {

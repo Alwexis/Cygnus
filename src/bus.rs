@@ -10,12 +10,15 @@ const INTERNAL_RAM_END: u32 = 0x0FFFF;
 
 const EXTERNAL_RAM_START: u32 = 0x10000;
 const EXTERNAL_RAM_END: u32 = 0x1FFFF;
+const VIDEO_LOG_LIMIT: usize = 128;
 
 pub struct Bus {
     memory: Memory,
     io: IO,
     internal_ram: Vec<u8>,
     external_ram: Vec<u8>,
+    video_write_counts: [u64; 256],
+    video_writes: Vec<(u8, u8)>,
 }
 
 impl Bus {
@@ -27,6 +30,8 @@ impl Bus {
             io: IO::new_with_linear_bank(linear_bank),
             internal_ram: vec![0; INTERNAL_RAM_SIZE],
             external_ram: vec![0; EXTERNAL_RAM_SIZE],
+            video_write_counts: [0; 256],
+            video_writes: Vec::with_capacity(VIDEO_LOG_LIMIT),
         };
         bus.memory.sync_bank_registers(&bus.io);
         bus
@@ -100,7 +105,18 @@ impl Bus {
             }
             _ => value,
         };
+        if port < crate::video::VIDEO_REGISTER_COUNT as u8
+            || port == crate::video::COLOR_CONTROL_PORT
+        {
+            self.video_write_counts[usize::from(port)] += 1;
+            if self.video_writes.len() < VIDEO_LOG_LIMIT {
+                self.video_writes.push((port, value));
+            }
+        }
         self.io.write_port(port, value);
+        if port == 0x48 {
+            self.run_dma_transfer();
+        }
 
         match port {
             0xC0 | 0xC2 | 0xC3 => {
@@ -108,6 +124,19 @@ impl Bus {
             }
             _ => {}
         }
+    }
+
+    fn run_dma_transfer(&mut self) {
+        let Some((mut source, mut destination, count)) = self.io.dma_transfer() else {
+            return;
+        };
+        for _ in 0..count {
+            let value = self.read_byte(source).unwrap_or(0xFF);
+            self.internal_ram[usize::from(destination)] = value;
+            source = (source + 1) & 0xFFFFF;
+            destination = destination.wrapping_add(1);
+        }
+        self.io.complete_dma(source, destination);
     }
 
     pub fn tick(&mut self, cycles: u32) {
@@ -135,6 +164,18 @@ impl Bus {
 
     pub fn framebuffer(&self) -> &[u8] {
         self.io.video().framebuffer()
+    }
+
+    pub fn palette_color(&self, index: usize) -> u32 {
+        self.io.video().palette_color(index, &self.internal_ram)
+    }
+
+    pub fn video_write_counts(&self) -> &[u64; 256] {
+        &self.video_write_counts
+    }
+
+    pub fn video_writes(&self) -> &[(u8, u8)] {
+        &self.video_writes
     }
 
     pub fn render_frame(&mut self) {
@@ -275,5 +316,33 @@ mod tests {
         bus.write_port(0xB5, 0x40);
 
         assert_eq!(bus.read_port(0xB5), 0x44);
+    }
+
+    #[test]
+    fn dma_copies_rom_bytes_into_internal_ram() {
+        let mut bus = Bus::new(test_cartridge());
+
+        bus.write_port(0xC2, 2);
+        assert_eq!(bus.read_port(0xC2), 2);
+        bus.write_port(0x40, 0x00);
+        bus.write_port(0x41, 0x00);
+        bus.write_port(0x42, 0x02);
+        bus.write_port(0x43, 0x00);
+        bus.write_port(0x44, 0x00);
+        bus.write_port(0x45, 0xFE);
+        bus.write_port(0x46, 0x04);
+        bus.write_port(0x47, 0x00);
+        assert_eq!(bus.read_port(0x40), 0x00);
+        assert_eq!(bus.read_port(0x42), 0x02);
+        assert_eq!(bus.read_port(0x44), 0x00);
+        assert_eq!(bus.read_port(0x45), 0xFE);
+        assert_eq!(bus.read_port(0x46), 4);
+        assert_eq!(bus.read_byte(0x20000), Some(2));
+        bus.write_port(0x48, 0x80);
+
+        assert_eq!(bus.read_byte(0xFE00), Some(2));
+        assert_eq!(bus.read_byte(0xFE03), Some(2));
+        assert_eq!(bus.read_port(0x46), 0);
+        assert_eq!(bus.read_port(0x48), 0);
     }
 }

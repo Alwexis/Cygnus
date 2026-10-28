@@ -1059,6 +1059,53 @@ impl Cpu {
         let reg = (modrm >> 3) & 7;
         let width = if opcode == 0xF6 { 8 } else { 16 };
 
+        if reg == 2 {
+            if mode == 0b11 {
+                if width == 8 {
+                    self.set_register8(modrm & 7, !self.get_register8(modrm & 7));
+                } else {
+                    self.set_register16(modrm & 7, !self.get_register16(modrm & 7));
+                }
+            } else {
+                let (segment, offset) = self.decode_memory_address(bus, modrm)?;
+                if width == 8 {
+                    let value = self.read_memory_byte(bus, segment, offset)?;
+                    self.write_memory_byte(bus, segment, offset, !value)?;
+                } else {
+                    let value = self.read_memory_word(bus, segment, offset)?;
+                    self.write_memory_word(bus, segment, offset, !value)?;
+                }
+            }
+            return Ok(());
+        }
+
+        if reg == 4 {
+            let operand = if mode == 0b11 {
+                if width == 8 {
+                    u16::from(self.get_register8(modrm & 7))
+                } else {
+                    self.get_register16(modrm & 7)
+                }
+            } else {
+                let (segment, offset) = self.decode_memory_address(bus, modrm)?;
+                if width == 8 {
+                    u16::from(self.read_memory_byte(bus, segment, offset)?)
+                } else {
+                    self.read_memory_word(bus, segment, offset)?
+                }
+            };
+
+            if width == 8 {
+                let result = u16::from(self.get_register8(0)) * operand;
+                self.ax = result;
+            } else {
+                let result = u32::from(self.ax) * u32::from(operand);
+                self.ax = result as u16;
+                self.dx = (result >> 16) as u16;
+            }
+            return Ok(());
+        }
+
         if reg == 3 {
             let memory_address = if mode == 0b11 {
                 None
@@ -1202,6 +1249,31 @@ impl Cpu {
             self.di = self.di.wrapping_sub(2);
         }
 
+        Ok(())
+    }
+
+    fn execute_outs_byte(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
+        let value = self.read_memory_byte(bus, self.ds, self.si)?;
+        bus.write_port(self.dx as u8, value);
+        if self.flags & FLAG_DIRECTION == 0 {
+            self.si = self.si.wrapping_add(1);
+        } else {
+            self.si = self.si.wrapping_sub(1);
+        }
+        Ok(())
+    }
+
+    fn execute_outs_word(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
+        let value = self.read_memory_word(bus, self.ds, self.si)?;
+        let [low, high] = value.to_le_bytes();
+        let port = self.dx as u8;
+        bus.write_port(port, low);
+        bus.write_port(port.wrapping_add(1), high);
+        if self.flags & FLAG_DIRECTION == 0 {
+            self.si = self.si.wrapping_add(2);
+        } else {
+            self.si = self.si.wrapping_sub(2);
+        }
         Ok(())
     }
 
@@ -1498,11 +1570,15 @@ impl Cpu {
             // STOSW
             0xAB => self.execute_stos_word(bus)?,
 
-            // REP MOVSW / REP STOSW
+            // OUTSB / OUTSW
+            0x6E => self.execute_outs_byte(bus)?,
+            0x6F => self.execute_outs_word(bus)?,
+
+            // REP MOVSW / REP STOSW / REP OUTSB / REP OUTSW
             0xF3 => {
                 let repeated_opcode = self.fetch_byte(bus)?;
 
-                if repeated_opcode != 0xA5 && repeated_opcode != 0xAB {
+                if !matches!(repeated_opcode, 0x6E | 0x6F | 0xA5 | 0xAB) {
                     return Err(CpuError::UnsupportedOpcode {
                         opcode: repeated_opcode,
                         cs: self.cs,
@@ -1513,8 +1589,12 @@ impl Cpu {
                 while self.cx != 0 {
                     if repeated_opcode == 0xA5 {
                         self.execute_movs_word(bus)?;
-                    } else {
+                    } else if repeated_opcode == 0xAB {
                         self.execute_stos_word(bus)?;
+                    } else if repeated_opcode == 0x6E {
+                        self.execute_outs_byte(bus)?;
+                    } else {
+                        self.execute_outs_word(bus)?;
                     }
                     self.cx = self.cx.wrapping_sub(1);
                 }
@@ -1556,6 +1636,14 @@ impl Cpu {
             0x76 => {
                 let displacement = self.fetch_byte(bus)? as i8;
                 if self.flags & (FLAG_CARRY | FLAG_ZERO) != 0 {
+                    self.ip = self.ip.wrapping_add_signed(displacement as i16);
+                }
+            }
+
+            // JA / JNBE rel8
+            0x77 => {
+                let displacement = self.fetch_byte(bus)? as i8;
+                if self.flags & (FLAG_CARRY | FLAG_ZERO) == 0 {
                     self.ip = self.ip.wrapping_add_signed(displacement as i16);
                 }
             }
@@ -2211,6 +2299,31 @@ mod tests {
     }
 
     #[test]
+    fn rep_outsw_writes_words_to_video_ports_and_updates_si() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ds = 0;
+        cpu.si = 0x0200;
+        cpu.cx = 2;
+        cpu.dx = 0x20;
+        assert!(bus.write_byte(0x0200, 0x34));
+        assert!(bus.write_byte(0x0201, 0x12));
+        assert!(bus.write_byte(0x0202, 0x78));
+        assert!(bus.write_byte(0x0203, 0x56));
+        write_program(&mut bus, &[0xF3, 0x6F]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_port(0x20), 0x78);
+        assert_eq!(bus.read_port(0x21), 0x56);
+        assert_eq!(bus.read_port(0x22), 0);
+        assert_eq!(bus.read_port(0x23), 0);
+        assert_eq!(cpu.si, 0x0204);
+        assert_eq!(cpu.cx, 0);
+    }
+
+    #[test]
     fn segment_override_moffs_writes_accumulator_to_selected_segment() {
         let mut bus = test_bus();
         let mut cpu = cpu_at_zero();
@@ -2495,6 +2608,19 @@ mod tests {
 
         assert_eq!(cpu.ax, 3);
         assert_eq!(cpu.dx, 1);
+    }
+
+    #[test]
+    fn not_word_register_inverts_all_bits() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0x0F0F;
+        write_program(&mut bus, &[0xF7, 0xD0]); // NOT AX
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ax, 0xF0F0);
     }
 
     #[test]

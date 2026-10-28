@@ -70,6 +70,28 @@ impl Video {
         (index < 16).then(|| self.registers[usize::from(PALETTE_START) + index])
     }
 
+    pub fn palette_color(&self, index: usize, ram: &[u8]) -> u32 {
+        if self.color_control & 0x80 != 0 {
+            let offset = 0xFE00 + index.min(255) * 2;
+            let low = u16::from(ram.get(offset).copied().unwrap_or(0));
+            let high = u16::from(ram.get(offset + 1).copied().unwrap_or(0));
+            let value = low | (high << 8);
+            let red = u32::from((value >> 8) & 0x0F) * 17;
+            let green = u32::from((value >> 4) & 0x0F) * 17;
+            let blue = u32::from(value & 0x0F) * 17;
+            return (red << 16) | (green << 8) | blue;
+        }
+
+        let index = index.min(15);
+        let low = u16::from(self.registers[usize::from(PALETTE_START) + index * 2]);
+        let high = u16::from(self.registers[usize::from(PALETTE_START) + index * 2 + 1]);
+        let value = low | (high << 8);
+        let red = u32::from(value & 0x0F) * 17;
+        let green = u32::from((value >> 4) & 0x0F) * 17;
+        let blue = u32::from((value >> 8) & 0x0F) * 17;
+        (red << 16) | (green << 8) | blue
+    }
+
     pub fn render_background(&mut self, ram: &[u8]) {
         self.clear(self.registers[usize::from(BORDER_COLOR_PORT)] & 0x0F);
         let display_control = self.registers[usize::from(DISPLAY_CONTROL_PORT)];
@@ -111,14 +133,14 @@ impl Video {
         let scroll_x = usize::from(self.registers[usize::from(scroll_x_port)]);
         let scroll_y = usize::from(self.registers[usize::from(scroll_y_port)]);
         let tile_base = if self.color_control & 0x40 != 0 {
-            0x4000
-        } else {
             0x2000
+        } else {
+            0x1000
         };
         let tile_size = if self.color_control & 0x40 != 0 {
-            32
-        } else {
             16
+        } else {
+            8
         };
 
         for y in 0..SCREEN_HEIGHT {
@@ -127,9 +149,9 @@ impl Video {
             let pixel_y = source_y & 7;
             for x in 0..SCREEN_WIDTH {
                 let source_x = x + scroll_x;
-                let tile_col = (source_x / 8) & 0x3F;
+                let tile_col = (source_x / 8) & 0x1F;
                 let pixel_x = source_x & 7;
-                let map_offset = map_base + (tile_row * 64 + tile_col) * 2;
+                let map_offset = map_base + (tile_row * 32 + tile_col) * 2;
                 let Some(&low) = ram.get(map_offset) else {
                     continue;
                 };
@@ -138,23 +160,37 @@ impl Video {
                 };
                 let tile_map = u16::from_le_bytes([low, high]);
                 let tile = usize::from(tile_map & 0x01FF);
+                let palette = usize::from((tile_map >> 9) & 0x0F);
+                let tile_bank = tile_map & 0x2000 != 0;
                 let flipped_x = tile_map & 0x4000 != 0;
                 let flipped_y = tile_map & 0x8000 != 0;
                 let source_pixel_x = if flipped_x { 7 - pixel_x } else { pixel_x };
                 let source_pixel_y = if flipped_y { 7 - pixel_y } else { pixel_y };
-                let tile_offset = tile_base + tile * tile_size;
-                let Some(&packed) =
-                    ram.get(tile_offset + source_pixel_y * (tile_size / 8) + source_pixel_x / 2)
-                else {
-                    continue;
-                };
-                let color = if source_pixel_x & 1 == 0 {
-                    packed >> 4
+                let tile_offset = tile_base + if tile_bank { 0x2000 } else { 0 } + tile * tile_size;
+                let color = if self.color_control & 0x40 != 0 {
+                    let row_offset = tile_offset + source_pixel_y * 4;
+                    let mut color = 0;
+                    for plane in 0..4 {
+                        let Some(&plane_bits) = ram.get(row_offset + plane) else {
+                            continue;
+                        };
+                        color |= ((plane_bits >> (7 - source_pixel_x)) & 1) << plane;
+                    }
+                    color
                 } else {
-                    packed & 0x0F
+                    let Some(&packed) =
+                        ram.get(tile_offset + source_pixel_y * 2 + source_pixel_x / 4)
+                    else {
+                        continue;
+                    };
+                    (packed >> (6 - (source_pixel_x & 3) * 2)) & 0x03
                 };
                 if !transparent_zero || color != 0 {
-                    self.framebuffer[y * SCREEN_WIDTH + x] = color;
+                    self.framebuffer[y * SCREEN_WIDTH + x] = if self.color_control & 0x80 != 0 {
+                        ((palette << 4) | usize::from(color)) as u8
+                    } else {
+                        color
+                    };
                 }
             }
         }
@@ -163,7 +199,7 @@ impl Video {
     fn render_sprites(&mut self, ram: &[u8]) {
         let table_base = usize::from(self.registers[usize::from(SPRITE_TABLE_PORT)] & 0x1F) << 9;
         let tile_base =
-            0x4000 + (usize::from(self.registers[usize::from(SPRITE_TILE_BASE_PORT)]) << 2);
+            0x2000 + (usize::from(self.registers[usize::from(SPRITE_TILE_BASE_PORT)]) << 2);
         let count = usize::from(self.registers[usize::from(SPRITE_COUNT_PORT)]);
 
         for index in (0..count.min(128)).rev() {
@@ -268,7 +304,19 @@ mod tests {
     }
 
     #[test]
-    fn renders_a_packed_four_bit_background_tile() {
+    fn color_mode_reads_rgb444_palette_from_internal_ram() {
+        let mut video = Video::new();
+        let mut ram = vec![0; 0x10000];
+
+        video.write_port(COLOR_CONTROL_PORT, 0xC0);
+        ram[0xFE00] = 0x34;
+        ram[0xFE01] = 0x12;
+
+        assert_eq!(video.palette_color(0, &ram), 0x223344);
+    }
+
+    #[test]
+    fn renders_a_planar_four_bit_background_tile() {
         let mut video = Video::new();
         let mut ram = vec![0; 0x10000];
 
@@ -276,12 +324,29 @@ mod tests {
         video.write_port(COLOR_CONTROL_PORT, 0x40);
         ram[0] = 0;
         ram[1] = 0;
-        ram[0x4000] = 0x12;
+        ram[0x2000] = 0x80;
+        ram[0x2001] = 0x40;
 
         video.render_background(&ram);
 
         assert_eq!(video.pixel(0, 0), Some(1));
         assert_eq!(video.pixel(1, 0), Some(2));
+    }
+
+    #[test]
+    fn color_tile_bank_selects_the_second_tile_bank() {
+        let mut video = Video::new();
+        let mut ram = vec![0; 0x10000];
+
+        video.write_port(DISPLAY_CONTROL_PORT, 0x01);
+        video.write_port(COLOR_CONTROL_PORT, 0x40);
+        ram[0] = 0x00;
+        ram[1] = 0x20;
+        ram[0x4000] = 0x80;
+
+        video.render_background(&ram);
+
+        assert_eq!(video.pixel(0, 0), Some(1));
     }
 
     #[test]
@@ -296,8 +361,10 @@ mod tests {
         ram[1] = 0;
         ram[0x800] = 1;
         ram[0x801] = 0;
-        ram[0x4000] = 0x12;
-        ram[0x4020] = 0x30;
+        ram[0x2000] = 0x80;
+        ram[0x2001] = 0x40;
+        ram[0x2010] = 0x80;
+        ram[0x2011] = 0xC0;
 
         video.render_background(&ram);
 
@@ -315,10 +382,10 @@ mod tests {
         video.write_port(SPRITE_COUNT_PORT, 1);
         ram[2] = 0;
         ram[3] = 0;
-        ram[0x4000] = 0x80;
-        ram[0x4001] = 0x00;
-        ram[0x4002] = 0x00;
-        ram[0x4003] = 0x00;
+        ram[0x2000] = 0x80;
+        ram[0x2001] = 0x00;
+        ram[0x2002] = 0x00;
+        ram[0x2003] = 0x00;
 
         video.render_background(&ram);
 
