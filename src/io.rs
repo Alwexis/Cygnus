@@ -7,12 +7,28 @@ const ROM_LINEAR_BANK_PORT: u8 = 0xC0;
 const RAM_BANK_PORT: u8 = 0xC1;
 const ROM_BANK0_PORT: u8 = 0xC2;
 const ROM_BANK1_PORT: u8 = 0xC3;
+const TIMER_CONTROL_PORT: u8 = 0xA2;
+const HORIZONTAL_TIMER_PORT: u8 = 0xA4;
+const VERTICAL_TIMER_PORT: u8 = 0xA6;
+const IRQ_BASE_PORT: u8 = 0xB0;
+const IRQ_ENABLE_PORT: u8 = 0xB2;
+const IRQ_ACK_PORT: u8 = 0xB6;
+
+const VERTICAL_TIMER_IRQ: u8 = 0x20;
+const HORIZONTAL_TIMER_IRQ: u8 = 0x80;
 
 pub struct IO {
     keyboard: Keyboard,
     keypad: Keypad,
     timer: Timer,
     pending_interrupt: Option<u8>,
+    timer_control: u8,
+    horizontal_timer: u16,
+    vertical_timer: u16,
+    irq_base: u8,
+    irq_enable: u8,
+    irq_ack: u8,
+    direct_timer: bool,
 
     rom_linear_bank: u8,
     ram_bank: u8,
@@ -74,6 +90,13 @@ impl IO {
             keypad: Keypad::new(),
             timer: Timer::new(),
             pending_interrupt: None,
+            timer_control: 0,
+            horizontal_timer: 0,
+            vertical_timer: 0,
+            irq_base: 0,
+            irq_enable: 0,
+            irq_ack: 0,
+            direct_timer: false,
             rom_linear_bank: linear_bank,
             ram_bank: 0,
             rom_bank0: 0,
@@ -86,17 +109,30 @@ impl IO {
     }
 
     pub fn configure_timer(&mut self, period: u32, vector: u8) {
+        self.direct_timer = true;
         self.timer.configure(period, vector);
     }
 
     pub fn tick(&mut self, cycles: u32) {
         if let Some(vector) = self.timer.tick(cycles) {
-            self.pending_interrupt = Some(vector);
+            if self.direct_timer {
+                self.pending_interrupt = Some(vector);
+            } else {
+                self.raise_interrupt(vector);
+            }
         }
     }
 
     pub fn request_interrupt(&mut self, vector: u8) {
         self.pending_interrupt = Some(vector);
+    }
+
+    fn raise_interrupt(&mut self, source: u8) {
+        if self.irq_enable & source == 0 {
+            return;
+        }
+        self.irq_ack |= source;
+        self.pending_interrupt = Some(self.irq_base.wrapping_add(source.trailing_zeros() as u8));
     }
 
     pub fn take_pending_interrupt(&mut self) -> Option<u8> {
@@ -126,6 +162,16 @@ impl IO {
             RAM_BANK_PORT => self.ram_bank,
             ROM_BANK0_PORT => self.rom_bank0,
             ROM_BANK1_PORT => self.rom_bank1,
+            TIMER_CONTROL_PORT => self.timer_control,
+            HORIZONTAL_TIMER_PORT..=0xA5 => {
+                (self.horizontal_timer >> ((port - HORIZONTAL_TIMER_PORT) * 8)) as u8
+            }
+            VERTICAL_TIMER_PORT..=0xA7 => {
+                (self.vertical_timer >> ((port - VERTICAL_TIMER_PORT) * 8)) as u8
+            }
+            IRQ_BASE_PORT => self.irq_base,
+            IRQ_ENABLE_PORT => self.irq_enable,
+            IRQ_ACK_PORT => self.irq_ack,
             _ => 0xFF,
         }
     }
@@ -139,6 +185,46 @@ impl IO {
             RAM_BANK_PORT => self.ram_bank = value,
             ROM_BANK0_PORT => self.rom_bank0 = value,
             ROM_BANK1_PORT => self.rom_bank1 = value,
+            TIMER_CONTROL_PORT => {
+                self.timer_control = value;
+                let (period, source) = if value & 0x04 != 0 {
+                    (self.vertical_timer, VERTICAL_TIMER_IRQ)
+                } else if value & 0x01 != 0 {
+                    (self.horizontal_timer, HORIZONTAL_TIMER_IRQ)
+                } else {
+                    (0, 0)
+                };
+                if source != 0 {
+                    self.direct_timer = false;
+                    let period = u32::from(period.max(1));
+                    self.timer.configure(period, source);
+                }
+            }
+            0xA5 => {
+                self.horizontal_timer = (self.horizontal_timer & 0x00FF) | (u16::from(value) << 8);
+                if self.timer_control & 0x01 != 0 {
+                    self.timer.configure(
+                        u32::from(self.horizontal_timer.max(1)),
+                        HORIZONTAL_TIMER_IRQ,
+                    );
+                }
+            }
+            HORIZONTAL_TIMER_PORT => {
+                self.horizontal_timer = (self.horizontal_timer & 0xFF00) | u16::from(value);
+            }
+            0xA7 => {
+                self.vertical_timer = (self.vertical_timer & 0x00FF) | (u16::from(value) << 8);
+                if self.timer_control & 0x04 != 0 {
+                    self.timer
+                        .configure(u32::from(self.vertical_timer.max(1)), VERTICAL_TIMER_IRQ);
+                }
+            }
+            VERTICAL_TIMER_PORT => {
+                self.vertical_timer = (self.vertical_timer & 0xFF00) | u16::from(value);
+            }
+            IRQ_BASE_PORT => self.irq_base = value,
+            IRQ_ENABLE_PORT => self.irq_enable = value,
+            IRQ_ACK_PORT => self.irq_ack &= !value,
             _ => {}
         }
     }
@@ -199,5 +285,33 @@ mod tests {
         assert_eq!(io.take_pending_interrupt(), Some(0x08));
         io.tick(3);
         assert_eq!(io.take_pending_interrupt(), Some(0x08));
+    }
+
+    #[test]
+    fn wonder_swan_timer_registers_raise_enabled_irq_source() {
+        let mut io = IO::new();
+
+        io.write_port(IRQ_BASE_PORT, 0x10);
+        io.write_port(IRQ_ENABLE_PORT, VERTICAL_TIMER_IRQ);
+        io.write_port(VERTICAL_TIMER_PORT, 3);
+        io.write_port(VERTICAL_TIMER_PORT + 1, 0);
+        io.write_port(TIMER_CONTROL_PORT, 0x04);
+
+        io.tick(3);
+
+        assert_eq!(io.read_port(IRQ_ACK_PORT), VERTICAL_TIMER_IRQ);
+        assert_eq!(io.take_pending_interrupt(), Some(0x15));
+    }
+
+    #[test]
+    fn writing_irq_ack_clears_only_selected_sources() {
+        let mut io = IO::new();
+
+        io.write_port(IRQ_ENABLE_PORT, VERTICAL_TIMER_IRQ | HORIZONTAL_TIMER_IRQ);
+        io.request_interrupt(0x15);
+        io.irq_ack = VERTICAL_TIMER_IRQ | HORIZONTAL_TIMER_IRQ;
+        io.write_port(IRQ_ACK_PORT, VERTICAL_TIMER_IRQ);
+
+        assert_eq!(io.read_port(IRQ_ACK_PORT), HORIZONTAL_TIMER_IRQ);
     }
 }
