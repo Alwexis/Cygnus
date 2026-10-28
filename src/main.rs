@@ -60,6 +60,7 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         Some(byte) => println!("Lectura de 0x20000: {:#04X}", byte),
         None => println!("Lectura de 0x20000: sin datos"),
     }
+    bus.write_port(0xC2, 0);
 
     println!("\nPrueba de RAM:");
     bus.write_byte(0x0010, 0xA5);
@@ -103,6 +104,12 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             executed, cpu.cs, cpu.ip, error
         ),
     }
+    println!(
+        "Bancos al detenerse: C0={:#04X}, C2={:#04X}, C3={:#04X}",
+        bus.read_port(0xC0),
+        bus.read_port(0xC2),
+        bus.read_port(0xC3)
+    );
     println!("Últimas instrucciones:");
     for entry in trace {
         println!(

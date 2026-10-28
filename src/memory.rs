@@ -51,6 +51,10 @@ impl Memory {
         self.set_linear_bank(io.rom_linear_bank());
     }
 
+    pub fn rom_size(&self) -> usize {
+        self.cartridge.size()
+    }
+
     pub fn read_byte(&self, address: u32) -> Option<u8> {
         let offset = match address {
             ROM0_START..=ROM0_END => {

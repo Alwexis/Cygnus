@@ -20,12 +20,16 @@ pub struct Bus {
 
 impl Bus {
     pub fn new(cartridge: Cartridge) -> Self {
-        Self {
+        let linear_bank = cartridge.size().div_ceil(0x100000).saturating_sub(1) as u8;
+
+        let mut bus = Self {
             memory: Memory::new(cartridge),
-            io: IO::new(),
+            io: IO::new_with_linear_bank(linear_bank),
             internal_ram: vec![0; INTERNAL_RAM_SIZE],
             external_ram: vec![0; EXTERNAL_RAM_SIZE],
-        }
+        };
+        bus.memory.sync_bank_registers(&bus.io);
+        bus
     }
 
     /// Lee RAM interna, SRAM del cartucho o ROM.
@@ -74,6 +78,27 @@ impl Bus {
     }
 
     pub fn write_port(&mut self, port: u8, value: u8) {
+        let value = match port {
+            0xC0 => {
+                let bank_count = self.memory.rom_size() / 0x100000;
+                if bank_count > 1 {
+                    let mask = bank_count.next_power_of_two().saturating_sub(1);
+                    value & mask as u8
+                } else {
+                    value
+                }
+            }
+            0xC2 | 0xC3 => {
+                let bank_count = self.memory.rom_size() / 0x10000;
+                if bank_count > 1 {
+                    let mask = bank_count.next_power_of_two().saturating_sub(1);
+                    value & mask as u8
+                } else {
+                    value
+                }
+            }
+            _ => value,
+        };
         self.io.write_port(port, value);
 
         match port {
@@ -185,6 +210,16 @@ mod tests {
 
         assert_eq!(bus.read_byte(0x20000), Some(2));
         assert_eq!(bus.read_port(0xC2), 2);
+    }
+
+    #[test]
+    fn test_rom_bank_ports_mask_values_to_cartridge_size() {
+        let mut bus = Bus::new(test_cartridge());
+
+        bus.write_port(0xC3, 0xDE);
+
+        assert_eq!(bus.read_port(0xC3), 0x1E);
+        assert_eq!(bus.read_byte(0x30000), Some(30));
     }
 
     #[test]

@@ -20,10 +20,14 @@ pub struct IO {
 
 impl IO {
     pub fn new() -> Self {
+        Self::new_with_linear_bank(0)
+    }
+
+    pub fn new_with_linear_bank(linear_bank: u8) -> Self {
         Self {
             keyboard: Keyboard::new(),
             keypad: Keypad::new(),
-            rom_linear_bank: 0,
+            rom_linear_bank: linear_bank,
             ram_bank: 0,
             rom_bank0: 0,
             rom_bank1: 1,

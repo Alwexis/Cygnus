@@ -325,6 +325,66 @@ impl Cpu {
         Ok(())
     }
 
+    fn execute_imul_immediate(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
+        let modrm = self.fetch_byte(bus)?;
+        let mode = modrm >> 6;
+        let reg = (modrm >> 3) & 7;
+        let rm = modrm & 7;
+        let source = if mode == 0b11 {
+            self.get_register16(rm)
+        } else {
+            let (segment, offset) = self.decode_memory_address(bus, modrm)?;
+            self.read_memory_word(bus, segment, offset)?
+        };
+        let immediate = self.fetch_byte(bus)? as i8 as i16;
+        let result = i32::from(source as i16) * i32::from(immediate);
+        let value = result as i16 as u16;
+        self.set_register16(reg, value);
+        self.set_flag(FLAG_CARRY, !(-32768..=32767).contains(&result));
+        self.set_flag(FLAG_OVERFLOW, !(-32768..=32767).contains(&result));
+        Ok(())
+    }
+
+    fn execute_inc_dec_byte(&mut self, bus: &mut Bus) -> Result<(), CpuError> {
+        let modrm = self.fetch_byte(bus)?;
+        let operation = (modrm >> 3) & 7;
+        if operation > 1 {
+            return Err(CpuError::UnsupportedOpcode {
+                opcode: 0xFE,
+                cs: self.cs,
+                ip: self.ip.wrapping_sub(2),
+            });
+        }
+
+        let carry = self.flags & FLAG_CARRY;
+        let mode = modrm >> 6;
+        let memory_address = if mode == 0b11 {
+            None
+        } else {
+            Some(self.decode_memory_address(bus, modrm)?)
+        };
+        let value = if let Some((segment, offset)) = memory_address {
+            u16::from(self.read_memory_byte(bus, segment, offset)?)
+        } else {
+            u16::from(self.get_register8(modrm & 7))
+        };
+        let alu_operation = if operation == 0 {
+            AluOperation::Add
+        } else {
+            AluOperation::Sub
+        };
+        let result = self.execute_alu(alu_operation, value, 1, 8) as u8;
+        self.flags = (self.flags & !FLAG_CARRY) | carry | FLAG_RESERVED;
+
+        if memory_address.is_none() {
+            self.set_register8(modrm & 7, result);
+        } else {
+            let (segment, offset) = memory_address.expect("memory address was decoded");
+            self.write_memory_byte(bus, segment, offset, result)?;
+        }
+        Ok(())
+    }
+
     fn push_word(&mut self, bus: &mut Bus, value: u16) -> Result<(), CpuError> {
         self.sp = self.sp.wrapping_sub(2);
         self.write_memory_word(bus, self.ss, self.sp, value)
@@ -620,15 +680,6 @@ impl Cpu {
             return Ok(());
         }
 
-        // Las operaciones ALU siguen soportadas en modo registro-registro.
-        if mode != 0b11 {
-            return Err(CpuError::UnsupportedOpcode {
-                opcode,
-                cs: self.cs,
-                ip: self.ip.wrapping_sub(2),
-            });
-        }
-
         let operation = match opcode & 0xFC {
             0x00 => AluOperation::Add,
             0x08 => AluOperation::Or,
@@ -645,29 +696,54 @@ impl Cpu {
             }
         };
 
+        let memory_address = if mode == 0b11 {
+            None
+        } else {
+            Some(self.decode_memory_address(bus, modrm)?)
+        };
+        let memory_value = if let Some((segment, offset)) = memory_address {
+            if width == 8 {
+                u16::from(self.read_memory_byte(bus, segment, offset)?)
+            } else {
+                self.read_memory_word(bus, segment, offset)?
+            }
+        } else {
+            0
+        };
         let (destination, source) = if width == 8 {
             let left = if direction_to_reg {
-                self.get_register8(reg)
+                u16::from(self.get_register8(reg))
+            } else if memory_address.is_some() {
+                memory_value
             } else {
-                self.get_register8(rm)
+                u16::from(self.get_register8(rm))
             };
 
             let right = if direction_to_reg {
-                self.get_register8(rm)
+                if memory_address.is_some() {
+                    memory_value
+                } else {
+                    u16::from(self.get_register8(rm))
+                }
             } else {
-                self.get_register8(reg)
+                u16::from(self.get_register8(reg))
             };
 
-            (u16::from(left), u16::from(right))
+            (left, right)
         } else {
             let left = if direction_to_reg {
                 self.get_register16(reg)
+            } else if memory_address.is_some() {
+                memory_value
             } else {
                 self.get_register16(rm)
             };
-
             let right = if direction_to_reg {
-                self.get_register16(rm)
+                if memory_address.is_some() {
+                    memory_value
+                } else {
+                    self.get_register16(rm)
+                }
             } else {
                 self.get_register16(reg)
             };
@@ -678,12 +754,18 @@ impl Cpu {
         let result = self.execute_alu(operation, destination, source, width);
 
         if operation != AluOperation::Compare {
-            let destination_register = if direction_to_reg { reg } else { rm };
-
-            if width == 8 {
-                self.set_register8(destination_register, result as u8);
+            if let Some((segment, offset)) = memory_address {
+                if !direction_to_reg {
+                    if width == 8 {
+                        self.write_memory_byte(bus, segment, offset, result as u8)?;
+                    } else {
+                        self.write_memory_word(bus, segment, offset, result)?;
+                    }
+                }
+            } else if width == 8 {
+                self.set_register8(if direction_to_reg { reg } else { rm }, result as u8);
             } else {
-                self.set_register16(destination_register, result);
+                self.set_register16(if direction_to_reg { reg } else { rm }, result);
             }
         }
 
@@ -833,6 +915,47 @@ impl Cpu {
         let mode = modrm >> 6;
         let reg = (modrm >> 3) & 7;
         let width = if opcode == 0xF6 { 8 } else { 16 };
+
+        if reg == 3 {
+            let memory_address = if mode == 0b11 {
+                None
+            } else {
+                Some(self.decode_memory_address(bus, modrm)?)
+            };
+            let value = if let Some((segment, offset)) = memory_address {
+                if opcode == 0xF6 {
+                    u16::from(self.read_memory_byte(bus, segment, offset)?)
+                } else {
+                    self.read_memory_word(bus, segment, offset)?
+                }
+            } else {
+                if opcode == 0xF6 {
+                    u16::from(self.get_register8(modrm & 7))
+                } else {
+                    self.get_register16(modrm & 7)
+                }
+            };
+            let result = self.execute_alu(
+                AluOperation::Sub,
+                0,
+                value,
+                if opcode == 0xF6 { 8 } else { 16 },
+            );
+            if let Some((segment, offset)) = memory_address {
+                if opcode == 0xF6 {
+                    self.write_memory_byte(bus, segment, offset, result as u8)?;
+                } else {
+                    self.write_memory_word(bus, segment, offset, result)?;
+                }
+            } else {
+                if opcode == 0xF6 {
+                    self.set_register8(modrm & 7, result as u8);
+                } else {
+                    self.set_register16(modrm & 7, result);
+                }
+            }
+            return Ok(());
+        }
 
         if reg != 0 {
             return Err(CpuError::UnsupportedOpcode {
@@ -1054,6 +1177,12 @@ impl Cpu {
                 self.push_word(bus, value)?;
             }
 
+            // IMUL r16,r/m16,imm8 sign-extended
+            0x6B => self.execute_imul_immediate(bus)?,
+
+            // INC/DEC r/m8
+            0xFE => self.execute_inc_dec_byte(bus)?,
+
             // JMP rel8
             0xEB => {
                 let displacement = self.fetch_byte(bus)? as i8;
@@ -1192,6 +1321,30 @@ impl Cpu {
             0x75 => {
                 let displacement = self.fetch_byte(bus)? as i8;
                 if self.flags & FLAG_ZERO == 0 {
+                    self.ip = self.ip.wrapping_add_signed(displacement as i16);
+                }
+            }
+
+            // JB / JC rel8
+            0x72 => {
+                let displacement = self.fetch_byte(bus)? as i8;
+                if self.flags & FLAG_CARRY != 0 {
+                    self.ip = self.ip.wrapping_add_signed(displacement as i16);
+                }
+            }
+
+            // JAE / JNC rel8
+            0x73 => {
+                let displacement = self.fetch_byte(bus)? as i8;
+                if self.flags & FLAG_CARRY == 0 {
+                    self.ip = self.ip.wrapping_add_signed(displacement as i16);
+                }
+            }
+
+            // JBE / JNA rel8
+            0x76 => {
+                let displacement = self.fetch_byte(bus)? as i8;
+                if self.flags & (FLAG_CARRY | FLAG_ZERO) != 0 {
                     self.ip = self.ip.wrapping_add_signed(displacement as i16);
                 }
             }
@@ -1983,6 +2136,88 @@ mod tests {
         assert_eq!(cpu.sp, 0x01FE);
         assert_eq!(bus.read_byte(0x01FE), Some(0x80));
         assert_eq!(bus.read_byte(0x01FF), Some(0xFF));
+    }
+
+    #[test]
+    fn and_register_into_memory_updates_memory() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 0x00F0;
+        assert!(bus.write_byte(0x0200, 0xFF));
+        assert!(bus.write_byte(0x0201, 0x00));
+        write_program(&mut bus, &[0x21, 0x06, 0x00, 0x02]); // AND [0200],AX
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(bus.read_byte(0x0200), Some(0xF0));
+        assert_eq!(bus.read_byte(0x0201), Some(0x00));
+    }
+
+    #[test]
+    fn carry_jump_takes_branch_when_carry_is_set() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.flags |= FLAG_CARRY;
+        write_program(&mut bus, &[0x72, 0x02, 0xB8, 0x34, 0x12]);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ip, 4);
+    }
+
+    #[test]
+    fn imul_register_by_signed_immediate_writes_destination_register() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.ax = 4;
+        write_program(&mut bus, &[0x6B, 0xD8, 0xFE]); // IMUL BX,AX,-2
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.bx, 0xFFF8);
+    }
+
+    #[test]
+    fn dec_byte_register_preserves_carry() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.set_register8(1, 2);
+        cpu.flags |= FLAG_CARRY;
+        write_program(&mut bus, &[0xFE, 0xC9]); // DEC CL
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.get_register8(1), 1);
+        assert_ne!(cpu.flags & FLAG_CARRY, 0);
+    }
+
+    #[test]
+    fn no_carry_jump_takes_branch_when_carry_is_clear() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        write_program(&mut bus, &[0x73, 0x02, 0xB8, 0x34, 0x12]); // JAE +2
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ip, 4);
+    }
+
+    #[test]
+    fn below_or_equal_jump_takes_branch_for_zero() {
+        let mut bus = test_bus();
+        let mut cpu = cpu_at_zero();
+
+        cpu.flags |= FLAG_ZERO;
+        write_program(&mut bus, &[0x76, 0x02, 0xB8, 0x34, 0x12]); // JBE +2
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.ip, 4);
     }
 
     #[test]
