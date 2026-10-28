@@ -11,8 +11,14 @@ use bus::Bus;
 use cartridge::Cartridge;
 use cpu::Cpu;
 use keyboard::Button;
+use minifb::{Scale, Window, WindowOptions};
 use std::env;
 use std::process;
+use std::thread;
+use std::time::Duration;
+
+const MAX_INSTRUCTIONS: u64 = 1_000_000;
+const DISPLAY_UPDATE_INTERVAL: u64 = 10_000;
 
 fn main() {
     let mut args = env::args();
@@ -72,15 +78,26 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut cpu = Cpu::new();
+    let mut window = Window::new(
+        "Cygnus - WonderSwan Color",
+        video::SCREEN_WIDTH,
+        video::SCREEN_HEIGHT,
+        WindowOptions {
+            scale: Scale::X4,
+            ..WindowOptions::default()
+        },
+    )?;
+    window.set_target_fps(60);
+
     println!(
         "\nEjecutando CPU desde el vector de reset físico {:#07X}...",
         Cpu::physical_address(cpu.cs, cpu.ip)
     );
 
     let mut trace = Vec::with_capacity(32);
-    let mut executed = 0;
+    let mut executed = 0u64;
     let result = loop {
-        if executed == 1_000_000 || cpu.halted {
+        if executed >= MAX_INSTRUCTIONS || cpu.halted || !window.is_open() {
             break Ok(());
         }
         match cpu.trace_step(&mut bus) {
@@ -90,10 +107,18 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 trace.push(entry);
                 executed += 1;
+                if executed % DISPLAY_UPDATE_INTERVAL == 0 {
+                    update_window(&mut window, bus.framebuffer())?;
+                }
             }
             Err(error) => break Err(error),
         }
     };
+    update_window(&mut window, bus.framebuffer())?;
+    while window.is_open() {
+        window.update();
+        thread::sleep(Duration::from_millis(16));
+    }
 
     match result {
         Ok(()) => println!(
@@ -105,6 +130,7 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             executed, cpu.cs, cpu.ip, error
         ),
     }
+
     println!(
         "Bancos al detenerse: C0={:#04X}, C2={:#04X}, C3={:#04X}",
         bus.read_port(0xC0),
@@ -119,6 +145,17 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    Ok(())
+}
+
+fn update_window(window: &mut Window, framebuffer: &[u8]) -> Result<(), minifb::Error> {
+    let mut pixels = vec![0; video::SCREEN_WIDTH * video::SCREEN_HEIGHT];
+    for (pixel, &color) in pixels.iter_mut().zip(framebuffer) {
+        let intensity = u32::from(color & 0x0F) * 17;
+        *pixel = (intensity << 16) | (intensity << 8) | intensity;
+    }
+
+    window.update_with_buffer(&pixels, video::SCREEN_WIDTH, video::SCREEN_HEIGHT)?;
     Ok(())
 }
 
