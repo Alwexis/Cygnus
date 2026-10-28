@@ -75,15 +75,40 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         Cpu::physical_address(cpu.cs, cpu.ip)
     );
 
-    match cpu.run_steps(&mut bus, 1_000) {
-        Ok(executed) => println!(
+    let mut trace = Vec::with_capacity(32);
+    let mut executed = 0;
+    let result = loop {
+        if executed == 100_000 || cpu.halted {
+            break Ok(());
+        }
+        match cpu.trace_step(&mut bus) {
+            Ok(entry) => {
+                if trace.len() == 32 {
+                    trace.remove(0);
+                }
+                trace.push(entry);
+                executed += 1;
+            }
+            Err(error) => break Err(error),
+        }
+    };
+
+    match result {
+        Ok(()) => println!(
             "CPU detenida después de {} instrucciones en {:04X}:{:04X}",
             executed, cpu.cs, cpu.ip
         ),
         Err(error) => println!(
-            "CPU detenida después de un error en {:04X}:{:04X}: {:?}",
-            cpu.cs, cpu.ip, error
+            "CPU detenida después de {} instrucciones por un error en {:04X}:{:04X}: {:?}",
+            executed, cpu.cs, cpu.ip, error
         ),
+    }
+    println!("Últimas instrucciones:");
+    for entry in trace {
+        println!(
+            "  {:04X}:{:04X}  opcode {:#04X}",
+            entry.cs, entry.ip, entry.opcode
+        );
     }
 
     Ok(())
