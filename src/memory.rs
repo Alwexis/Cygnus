@@ -1,4 +1,5 @@
 use crate::cartridge::Cartridge;
+use crate::io::IO;
 
 const ROM_BANK_SIZE: usize = 0x10000; // 64 KiB
 const LINEAR_BANK_SIZE: usize = 0x100000; // 1 MiB
@@ -23,7 +24,6 @@ impl Memory {
     pub fn new(cartridge: Cartridge) -> Self {
         Self {
             cartridge,
-            // para prueba
             rom_bank0: 0,
             rom_bank1: 1,
             linear_bank: 0,
@@ -42,25 +42,26 @@ impl Memory {
         self.linear_bank = bank;
     }
 
-    /// lee un byte de las ventanas ROM implementadas
-    /// None significa que la dirección no pertenece a una ventana
-    /// ROM implementada o que el desplazamiento excede el archivo
+    /// Copia a Memory la selección actual de bancos registrada en IO.
+    pub fn sync_bank_registers(&mut self, io: &IO) {
+        self.set_rom_bank0(io.rom_bank0());
+        self.set_rom_bank1(io.rom_bank1());
+        self.set_linear_bank(io.rom_linear_bank());
+    }
+
     pub fn read_byte(&self, address: u32) -> Option<u8> {
         let offset = match address {
             ROM0_START..=ROM0_END => {
                 usize::from(self.rom_bank0) * ROM_BANK_SIZE + (address - ROM0_START) as usize
             }
-
             ROM1_START..=ROM1_END => {
                 usize::from(self.rom_bank1) * ROM_BANK_SIZE + (address - ROM1_START) as usize
             }
-
             LINEAR_START..=LINEAR_END => {
                 usize::from(self.linear_bank) * LINEAR_BANK_SIZE
                     + 0x40000
                     + (address - LINEAR_START) as usize
             }
-
             _ => return None,
         };
 
@@ -72,35 +73,30 @@ impl Memory {
 mod tests {
     use super::*;
 
-    fn test_memory() -> Memory {
+    fn test_cartridge() -> Cartridge {
+        // ROM de 4 MiB: cada banco de 64 KiB contiene su número.
         let mut rom = vec![0; 4 * 1024 * 1024];
 
         for (bank, chunk) in rom.chunks_mut(ROM_BANK_SIZE).enumerate() {
             chunk.fill(bank as u8);
         }
 
-        Memory::new(Cartridge::from_bytes(rom).unwrap())
+        Cartridge::from_bytes(rom).expect("La ROM de prueba debe ser válida")
     }
 
     #[test]
-    fn should_read_from_rom_bank0() {
-        let memory = test_memory();
+    fn test_default_rom_bank_windows() {
+        let memory = Memory::new(test_cartridge());
 
         assert_eq!(memory.read_byte(0x20000), Some(0));
         assert_eq!(memory.read_byte(0x2FFFF), Some(0));
-    }
-
-    #[test]
-    fn should_read_from_rom_bank1() {
-        let memory = test_memory();
-
         assert_eq!(memory.read_byte(0x30000), Some(1));
         assert_eq!(memory.read_byte(0x3FFFF), Some(1));
     }
 
     #[test]
-    fn should_select_another_rom_bank() {
-        let mut memory = test_memory();
+    fn test_rom_bank0_can_be_changed() {
+        let mut memory = Memory::new(test_cartridge());
 
         memory.set_rom_bank0(2);
 
@@ -108,8 +104,8 @@ mod tests {
     }
 
     #[test]
-    fn should_select_another_linear_bank() {
-        let mut memory = test_memory();
+    fn test_linear_bank_can_be_changed() {
+        let mut memory = Memory::new(test_cartridge());
 
         memory.set_linear_bank(1);
 
@@ -117,19 +113,35 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_addresses_outside_rom_windows() {
-        let memory = test_memory();
+    fn test_address_outside_rom_windows_returns_none() {
+        let memory = Memory::new(test_cartridge());
 
-        assert_eq!(memory.read_byte(0x1FFFF), None);
+        assert_eq!(memory.read_byte(0x10000), None);
         assert_eq!(memory.read_byte(0x100000), None);
     }
 
     #[test]
-    fn should_return_none_when_selected_bank_exceeds_rom() {
-        let mut memory = test_memory();
+    fn test_invalid_bank_returns_none_when_outside_cartridge() {
+        let mut memory = Memory::new(test_cartridge());
 
         memory.set_rom_bank0(100);
 
         assert_eq!(memory.read_byte(0x20000), None);
+    }
+
+    #[test]
+    fn test_io_registers_can_update_memory_banks() {
+        let mut memory = Memory::new(test_cartridge());
+        let mut io = IO::new();
+
+        io.write_port(0xC2, 2);
+        io.write_port(0xC3, 3);
+        io.write_port(0xC0, 1);
+
+        memory.sync_bank_registers(&io);
+
+        assert_eq!(memory.read_byte(0x20000), Some(2));
+        assert_eq!(memory.read_byte(0x30000), Some(3));
+        assert_eq!(memory.read_byte(0x40000), Some(20));
     }
 }
