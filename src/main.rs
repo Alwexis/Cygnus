@@ -8,6 +8,7 @@ mod memory;
 
 use bus::Bus;
 use cartridge::Cartridge;
+use cpu::Cpu;
 use keyboard::Button;
 use std::env;
 use std::process;
@@ -66,6 +67,23 @@ fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     match bus.read_byte(0x0010) {
         Some(byte) => println!("RAM[0x0010]: {:#04X}", byte),
         None => println!("RAM[0x0010]: sin datos"),
+    }
+
+    let mut cpu = Cpu::new();
+    println!(
+        "\nEjecutando CPU desde el vector de reset físico {:#07X}...",
+        Cpu::physical_address(cpu.cs, cpu.ip)
+    );
+
+    match cpu.run_steps(&mut bus, 1_000) {
+        Ok(executed) => println!(
+            "CPU detenida después de {} instrucciones en {:04X}:{:04X}",
+            executed, cpu.cs, cpu.ip
+        ),
+        Err(error) => println!(
+            "CPU detenida después de un error en {:04X}:{:04X}: {:?}",
+            cpu.cs, cpu.ip, error
+        ),
     }
 
     Ok(())
