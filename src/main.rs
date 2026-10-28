@@ -1,13 +1,13 @@
+mod bus;
 mod cartridge;
 mod io;
 mod keyboard;
 mod keypad;
 mod memory;
 
+use bus::Bus;
 use cartridge::Cartridge;
-use io::IO;
 use keyboard::Button;
-use memory::Memory;
 use std::env;
 use std::process;
 
@@ -35,60 +35,49 @@ fn main() {
 fn load_cartridge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let cartridge = Cartridge::load(path)?;
 
-    // pra testear
-    println!(
-        "Byte físico ROM[0x20000]: {:#04X}",
-        cartridge.read_byte(0x20000).unwrap_or(0xFF)
-    );
-
     println!("Cartucho cargado: {}", path);
     println!("Tamaño: {} bytes", cartridge.size());
 
-    let mut io = IO::new();
-    let mut memory = Memory::new(cartridge);
+    let mut bus = Bus::new(cartridge);
 
-    // Configuramos los registros de bancos mediante los puertos de E/S.
-    io.write_port(0xC0, 0);
-    io.write_port(0xC2, 0);
-    io.write_port(0xC3, 1);
-
-    // Aplicamos los valores registrados al mapa de memoria.
-    memory.sync_bank_registers(&io);
-
-    println!("\nRegistros de bancos:");
-    println!("Puerto 0xC0: {:#04X}", io.read_port(0xC0));
-    println!("Puerto 0xC2: {:#04X}", io.read_port(0xC2));
-    println!("Puerto 0xC3: {:#04X}", io.read_port(0xC3));
-
-    println!("\nLectura mediante el mapa de memoria:");
+    println!("\nLectura de ROM mediante el bus:");
 
     for address in 0x20000..0x20010 {
-        match memory.read_byte(address) {
+        match bus.read_byte(address) {
             Some(byte) => println!("{:#07X}: {:#04X}", address, byte),
             None => println!("{:#07X}: sin datos", address),
         }
     }
 
-    // Cambiamos el banco visible en 0x20000.
-    io.write_port(0xC2, 2);
-    memory.sync_bank_registers(&io);
+    println!("\nSeleccionando el banco ROM 2 mediante el puerto 0xC2...");
+    bus.write_port(0xC2, 2);
 
-    println!("\nTras seleccionar el banco 2 en el puerto 0xC2:");
-    match memory.read_byte(0x20000) {
-        Some(byte) => println!("0x20000: {:#04X}", byte),
-        None => println!("0x20000: sin datos"),
+    println!("Puerto 0xC2: {:#04X}", bus.read_port(0xC2));
+
+    match bus.read_byte(0x20000) {
+        Some(byte) => println!("Lectura de 0x20000: {:#04X}", byte),
+        None => println!("Lectura de 0x20000: sin datos"),
+    }
+
+    println!("\nPrueba de RAM:");
+    bus.write_byte(0x0010, 0xA5);
+
+    match bus.read_byte(0x0010) {
+        Some(byte) => println!("RAM[0x0010]: {:#04X}", byte),
+        None => println!("RAM[0x0010]: sin datos"),
     }
 
     Ok(())
 }
 
 fn run_keyboard_demo() {
-    let mut io = IO::new();
+    let mut bus = Bus::new(
+        Cartridge::from_bytes(vec![0; 0x10000])
+            .expect("La ROM mínima de demostración debe ser válida"),
+    );
 
-    io.keyboard_mut().press(Button::A);
-    io.write_port(0xB5, 0x40);
+    bus.keyboard_mut().press(Button::A);
+    bus.write_port(0xB5, 0x40);
 
-    let value = io.read_port(0xB5);
-
-    println!("Port 0xB5: {:#04X}", value);
+    println!("Port 0xB5: {:#04X}", bus.read_port(0xB5));
 }
